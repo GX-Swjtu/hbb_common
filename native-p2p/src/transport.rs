@@ -15,6 +15,9 @@ use tokio::{
 };
 use tokio_util::codec::Framed;
 
+#[path = "transport_punch.rs"]
+mod punching;
+
 #[derive(Clone)]
 pub struct Identity {
     pub id: String,
@@ -79,7 +82,7 @@ pub struct Punched {
     pub socket: Arc<UdpSocket>,
     pub peer: SocketAddr,
     pub session: Session,
-    pub strategy: Option<crate::strategy::Strategy>,
+    pub strategy: crate::strategy::Behavior,
 }
 
 impl Session {
@@ -158,7 +161,7 @@ impl Session {
             ticket.expires > now()? && ticket.session.len() == 32,
             "invalid native ticket"
         );
-        ensure!(matches!(ticket.strategies, 0 | crate::strategy::VERSION), "unsupported native strategies");
+        ensure!(ticket.capability == crate::CAPABILITY, "native UDP capability not negotiated");
         let secret = sealedbox::open(&ticket.secret_box, pk, sk)
             .map_err(|_| anyhow::anyhow!("invalid sealed probe key"))?;
         ensure!(secret.len() == 32, "invalid probe key length");
@@ -173,72 +176,11 @@ impl Session {
         })
     }
 
-    pub async fn punch(self, stun_server: &str) -> Result<Punched> {
-        let deadline = self.deadline;
-        timeout_at(deadline, async move {
-            let (socket, addresses) = if self.ticket.strategies == crate::strategy::VERSION {
-                crate::stun::discover_profile(stun_server).await?
-            } else {
-                crate::stun::discover(stun_server).await?
-            };
-            log::info!(
-                "native-p2p UDP observations: {:?}, profile={:?}",
-                addresses,
-                crate::strategy::classify(&addresses)?
-            );
-            let mut action = Action::Prepare {
-                session: self.ticket.session.clone(),
-                addresses,
-            };
-            let plan = loop {
-                let reply = rpc(
-                    &self.endpoint,
-                    &self.identity,
-                    &self.server,
-                    action,
-                    Duration::from_secs(2),
-                )
-                .await?;
-                match reply {
-                    Reply::Plan(plan) => break plan,
-                    Reply::Waiting => {}
-                    Reply::Error(error) => bail!(error),
-                    _ => bail!("native session closed"),
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                action = Action::Poll {
-                    session: self.ticket.session.clone(),
-                };
-            };
-            ensure!(
-                plan.session == self.ticket.session,
-                "native plan session mismatch"
-            );
-            ensure!(plan.strategy.is_none() || self.ticket.strategies == crate::strategy::VERSION, "native strategy not negotiated");
-            log::info!("native-p2p selected strategy={:?}, sender={}", plan.strategy, plan.sender);
-            let (socket, peer) = tokio::select! {
-                result = crate::hole::punch(socket, &plan, &self.secret, deadline) => result?,
-                result = self.wait_for_cancellation() => return Err(result),
-            };
-            log::info!(
-                "native-p2p UDP confirmed, peer={peer}, sender={}, strategy={:?}",
-                plan.sender, plan.strategy
-            );
-            Ok(Punched {
-                socket,
-                peer,
-                session: self,
-                strategy: plan.strategy,
-            })
-        })
-        .await?
-    }
-
     /// The KCP acceptor relinquishes cancellation ownership to the caller, which
     /// still has to authenticate the device before reporting success. Server expiry
     /// bounds this lease if the caller exits during that handshake.
     pub fn handoff_to_caller(&mut self) {
-        if !self.ticket.initiator && self.ticket.strategies == crate::strategy::VERSION {
+        if !self.ticket.initiator {
             self.cancel_on_drop = false;
         }
     }
@@ -246,7 +188,6 @@ impl Session {
     /// Call only after KCP and the existing RustDesk device-identity handshake.
     /// The UDP-only diagnostic deliberately never rewards a strategy.
     pub async fn confirm_authenticated(&self) -> Result<()> {
-        if self.ticket.strategies == 0 { return Ok(()); }
         ensure!(self.ticket.initiator, "only native caller confirms authentication");
         let reply = rpc(
             &self.endpoint, &self.identity, &self.server,
@@ -273,7 +214,9 @@ impl Session {
             {
                 Ok(Reply::Plan(_)) => {}
                 Ok(_) => return anyhow::anyhow!("native peer cancelled or session expired"),
-                Err(error) => return error,
+                // A lost coordination packet does not mean the peer cancelled.
+                // The enclosing absolute deadline still bounds this attempt.
+                Err(error) => log::trace!("native cancellation check unavailable: {error}"),
             }
         }
     }
@@ -309,6 +252,34 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn temporary_rpc_loss_is_not_peer_cancellation() {
+        crate::init().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let (server, server_secret) = sign::gen_keypair();
+        let (device, key) = sign::gen_keypair();
+        let coordinator = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = Framed::new(stream, BytesCodec::new());
+                let message = RendezvousMessage::parse_from_bytes(&stream.next().await.unwrap().unwrap()).unwrap();
+                let request: Request = decode(&message.native_p2p_v1().payload, &device).unwrap();
+                if attempt == 0 { continue; } // A transient lost RPC response.
+                let response = Response { nonce: request.nonce, time: now().unwrap(), reply: Reply::Closed };
+                stream.send(envelope(encode(&response, &server_secret).unwrap()).write_to_bytes().unwrap().into()).await.unwrap();
+            }
+        });
+        let (pk, sk) = box_::gen_keypair();
+        let ticket = Ticket { session: id(), expires: now().unwrap() + 45, secret_box: seal(&[1; 32], pk.as_ref()).unwrap(),
+            peer_id: "peer".into(), signed_peer: vec![], initiator: true, capability: crate::CAPABILITY.into() };
+        let mut session = Session::new(&endpoint, Identity { id: "device".into(), key }, server, ticket, &pk, &sk, Instant::now() + Duration::from_secs(45)).unwrap();
+        session.cancel_on_drop = false;
+        let error = timeout(Duration::from_secs(4), session.wait_for_cancellation()).await.unwrap();
+        assert!(error.to_string().contains("peer cancelled"));
+        coordinator.await.unwrap();
+    }
 
     #[tokio::test]
     async fn old_server_is_abandoned_within_one_second() {

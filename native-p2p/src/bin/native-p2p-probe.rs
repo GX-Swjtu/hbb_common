@@ -54,8 +54,8 @@ async fn advertise(socket: &UdpSocket, identity: &Identity) -> Result<()> {
         &protocol::request(
             &identity.id,
             Action::Advertise {
-                version: p2p::VERSION,
-                strategies: p2p::strategy::VERSION,
+                capability: p2p::CAPABILITY.into(),
+                enabled: true,
             },
         )?,
         &identity.key,
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
                 .await?;
         report(
             "mapping",
-            serde_json::json!({"local":socket.local_addr()?, "observations":addresses, "profile":p2p::strategy::classify(&addresses)?}),
+            serde_json::json!({"local":socket.local_addr()?, "observations":addresses, "profile":p2p::strategy::classify(&p2p::candidates::Candidates { public: addresses.clone(), local: vec![], direct: None })?}),
         );
         return Ok(());
     }

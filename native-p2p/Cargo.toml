@@ -18,5 +18,11 @@ sodiumoxide = "0.2"
 tokio = { version = "1.44", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 protobuf-codegen = "3.7"
