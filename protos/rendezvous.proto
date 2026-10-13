@@ -4,6 +4,8 @@ package hbb;
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
+  uint32 native_p2p_version = 1000;
+  bytes native_p2p_capability = 1001;
 }
 
 enum ConnType {
@@ -240,6 +242,12 @@ message HttpProxyResponse {
   string error = 4;
 }
 
+// Fork extension: keep the upstream field numbers and messages unchanged.
+message NativeP2pV1 {
+  uint32 version = 1;
+  bytes payload = 2;
+}
+
 message RendezvousMessage {
   oneof union {
     RegisterPeer register_peer = 6;
@@ -265,5 +273,6 @@ message RendezvousMessage {
     HealthCheck hc = 26;
     HttpProxyRequest http_proxy_request = 27;
     HttpProxyResponse http_proxy_response = 28;
+    NativeP2pV1 native_p2p_v1 = 1000;
   }
 }

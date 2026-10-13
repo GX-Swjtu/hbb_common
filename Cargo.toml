@@ -8,6 +8,7 @@ edition = "2018"
 
 [features]
 default = []
+native-p2p = ["dep:rustdesk-native-p2p"]
 webrtc = ["dep:webrtc"]
 
 [dependencies]
@@ -98,3 +99,6 @@ sctk = { package = "smithay-client-toolkit", version = "0.20.0", default-feature
 ] }
 users = { version = "0.11" }
 x11 = "2.21"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+rustdesk-native-p2p = { path = "native-p2p", optional = true }

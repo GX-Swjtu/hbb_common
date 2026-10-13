@@ -24,6 +24,8 @@ pub mod udp;
 pub use env_logger;
 pub use log;
 pub mod bytes_codec;
+#[cfg(all(feature = "native-p2p", any(target_os = "windows", target_os = "linux")))]
+pub use rustdesk_native_p2p as native_p2p;
 pub use anyhow::{self, bail};
 pub use futures_util;
 pub mod config;
