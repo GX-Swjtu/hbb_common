@@ -95,3 +95,34 @@ fn parse(data: &[u8]) -> Result<(SocketAddr, Option<SocketAddr>)> {
         alternate,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn silent_stun_has_a_bounded_failure() {
+        crate::init().unwrap();
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let started = Instant::now();
+        let result = discover(&silent.local_addr().unwrap().to_string()).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn xor_mapping_and_alternate_address_are_parsed_without_rebinding() {
+        let mut data = vec![1, 1, 0, 24];
+        data.extend_from_slice(&COOKIE);
+        data.extend_from_slice(&[0; 12]);
+        data.extend_from_slice(&[0, 0x20, 0, 8, 0, 1]);
+        data.extend_from_slice(&(5000u16 ^ 0x2112).to_be_bytes());
+        data.extend([192, 0, 2, 1].iter().zip(COOKIE).map(|(a, b)| a ^ b));
+        data.extend_from_slice(&[0x80, 0x2c, 0, 8, 0, 1]);
+        data.extend_from_slice(&3479u16.to_be_bytes());
+        data.extend_from_slice(&[192, 0, 2, 2]);
+        assert_eq!(parse(&data).unwrap(), ("192.0.2.1:5000".parse().unwrap(), Some("192.0.2.2:3479".parse().unwrap())));
+        data.pop();
+        assert!(parse(&data).is_err());
+    }
+}
