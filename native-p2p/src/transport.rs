@@ -4,6 +4,7 @@ use crate::{
     wire::rendezvous::{self, NativeP2pV1, RendezvousMessage},
 };
 use anyhow::{bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use protobuf::Message;
 use sodiumoxide::crypto::{box_, sealedbox, sign};
@@ -95,6 +96,7 @@ impl Session {
             Action::Begin {
                 target: target.into(),
                 box_pk: pk.as_ref().to_vec(),
+                licence_key: STANDARD.encode(server.as_ref()),
             },
             Duration::from_secs(1),
         )

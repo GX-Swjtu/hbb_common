@@ -20,6 +20,7 @@ pub struct Device {
 
 struct Capability {
     device: Device,
+    enabled: bool,
     seen: u64,
     requests: VecDeque<(Vec<u8>, u64)>,
 }
@@ -50,11 +51,6 @@ impl Coordinator {
         self.devices.retain(|_, d| now.saturating_sub(d.seen) < 60);
     }
 
-    pub fn remove(&mut self, id: &str) {
-        self.devices.remove(id);
-        self.attempts.retain(|_, s| s.from != id && s.target != id);
-    }
-
     pub fn advertise(&mut self, device: Device, payload: &[u8]) -> Result<()> {
         let request: Request = protocol::decode(payload, &device.key)?;
         protocol::fresh(&request)?;
@@ -63,26 +59,34 @@ impl Coordinator {
                 && matches!(
                     request.action,
                     Action::Advertise {
-                        version: crate::VERSION
+                        version: 0 | crate::VERSION
                     }
                 ),
             "invalid capability"
         );
+        let enabled = matches!(request.action, Action::Advertise { version: crate::VERSION });
         let now = protocol::now()?;
         self.expire(now);
         if let Some(cap) = self.devices.get_mut(&device.id) {
             Self::consume(cap, &request, now)?;
             cap.device = device;
+            cap.enabled = enabled;
             cap.seen = now;
         } else {
             ensure!(self.devices.len() < MAX_DEVICES, "native device limit");
             let mut cap = Capability {
                 device,
+                enabled,
                 seen: now,
                 requests: VecDeque::new(),
             };
             Self::consume(&mut cap, &request, now)?;
             self.devices.insert(cap.device.id.clone(), cap);
+        }
+        if !enabled {
+            // Retain the capability's replay history so a captured withdrawal cannot
+            // cancel another attempt after this device enables the feature again.
+            self.attempts.retain(|_, s| s.from != request.id && s.target != request.id);
         }
         Ok(())
     }
@@ -106,6 +110,7 @@ impl Coordinator {
         payload: &[u8],
         source: SocketAddr,
         key: &sign::SecretKey,
+        licence_key: &str,
     ) -> Result<Outcome> {
         let now = protocol::now()?;
         self.expire(now);
@@ -114,6 +119,7 @@ impl Coordinator {
             .devices
             .get_mut(&id)
             .context("native capability not registered")?;
+        ensure!(cap.enabled, "native capability disabled");
         ensure!(
             cap.device.address.ip() == source.ip(),
             "native signaling exit changed"
@@ -121,7 +127,7 @@ impl Coordinator {
         let request: Request = protocol::decode(payload, &cap.device.key)?;
         protocol::fresh(&request)?;
         Self::consume(cap, &request, now)?;
-        let (reply, invite) = match self.apply(&request, now, key) {
+        let (reply, invite) = match self.apply(&request, now, key, licence_key) {
             Ok(value) => value,
             Err(error) => (Reply::Error(error.to_string()), None),
         };
@@ -143,13 +149,15 @@ impl Coordinator {
         request: &Request,
         now: u64,
         key: &sign::SecretKey,
+        licence_key: &str,
     ) -> Result<(Reply, Option<(SocketAddr, Vec<u8>)>)> {
         match &request.action {
-            Action::Begin { target, box_pk } => {
+            Action::Begin { target, box_pk, licence_key: supplied_key } => {
+                ensure!(licence_key.is_empty() || supplied_key == licence_key, "native server key mismatch");
                 let Some(peer) = self.devices.get(target) else {
                     return Ok((Reply::Unsupported, None));
                 };
-                if now.saturating_sub(peer.seen) > 30 || *target == request.id {
+                if !peer.enabled || now.saturating_sub(peer.seen) > 30 || *target == request.id {
                     return Ok((Reply::Unsupported, None));
                 }
                 ensure!(self.attempts.len() < MAX_SESSIONS, "native session limit");
@@ -307,6 +315,66 @@ mod tests {
     }
 
     #[test]
+    fn keyed_server_rejects_missing_or_wrong_key_before_inviting() {
+        crate::init().unwrap();
+        let mut c = Coordinator::default();
+        let (server, sk) = sign::gen_keypair();
+        let caller = register(&mut c, "caller", "192.0.2.1:1000");
+        let _target = register(&mut c, "target", "192.0.2.2:1000");
+        for supplied in [None, Some("wrong"), Some("required-key")] {
+            let mut action = serde_json::json!({"Begin": {
+                "target": "target", "box_pk": box_::gen_keypair().0.as_ref()
+            }});
+            if let Some(key) = supplied {
+                action["Begin"]["licence_key"] = key.into();
+            }
+            let request = protocol::request("caller", serde_json::from_value(action).unwrap()).unwrap();
+            let outcome = c.handle(
+                &protocol::encode(&request, &caller).unwrap(),
+                "192.0.2.1:2000".parse().unwrap(), &sk, "required-key",
+            ).unwrap();
+            let reply = protocol::decode::<Response>(&outcome.response, &server).unwrap().reply;
+            if supplied == Some("required-key") {
+                assert!(matches!(reply, Reply::Ticket(_)));
+                assert!(outcome.invite.is_some());
+            } else {
+                assert!(matches!(reply, Reply::Error(e) if e == "native server key mismatch"));
+                assert!(outcome.invite.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn capability_withdrawal_requires_signature_and_cannot_replay_after_reenable() {
+        crate::init().unwrap();
+        let mut c = Coordinator::default();
+        let (_, server) = sign::gen_keypair();
+        let caller = register(&mut c, "caller", "192.0.2.1:1000");
+        let target = register(&mut c, "target", "192.0.2.2:1000");
+        let device = || Device {
+            id: "target".into(), key: target.public_key(), signed_key: vec![],
+            address: "192.0.2.2:1000".parse().unwrap(),
+        };
+        let begin = protocol::request("caller", Action::Begin {
+            target: "target".into(), box_pk: box_::gen_keypair().0.as_ref().into(),
+            licence_key: String::new(),
+        }).unwrap();
+        let (Reply::Ticket(ticket), _) = c.apply(&begin, protocol::now().unwrap(), &server, "").unwrap()
+        else { panic!("expected ticket"); };
+        let off = protocol::request("target", Action::Advertise { version: 0 }).unwrap();
+        assert!(c.advertise(device(), &protocol::encode(&off, &caller).unwrap()).is_err());
+        assert!(matches!(c.plan(&ticket.session, "caller").unwrap(), Reply::Waiting));
+        let withdrawal = protocol::encode(&off, &target).unwrap();
+        c.advertise(device(), &withdrawal).unwrap();
+        assert!(c.plan(&ticket.session, "caller").is_err());
+        assert!(matches!(c.apply(&begin, protocol::now().unwrap(), &server, "").unwrap().0, Reply::Unsupported));
+        let on = protocol::request("target", Action::Advertise { version: crate::VERSION }).unwrap();
+        c.advertise(device(), &protocol::encode(&on, &target).unwrap()).unwrap();
+        assert!(c.advertise(device(), &withdrawal).is_err());
+        assert!(matches!(c.apply(&begin, protocol::now().unwrap(), &server, "").unwrap().0, Reply::Ticket(_)));
+    }
+
+    #[test]
     fn unsupported_peers_never_allocate_sessions_and_requests_cannot_replay() {
         crate::init().unwrap();
         let mut c = Coordinator::default();
@@ -317,12 +385,13 @@ mod tests {
             Action::Begin {
                 target: "android-or-old".into(),
                 box_pk: box_::gen_keypair().0.as_ref().into(),
+                licence_key: String::new(),
             },
         )
         .unwrap();
         let payload = protocol::encode(&request, &caller).unwrap();
         let result = c
-            .handle(&payload, "192.0.2.1:2000".parse().unwrap(), &sk)
+            .handle(&payload, "192.0.2.1:2000".parse().unwrap(), &sk, "")
             .unwrap();
         assert!(matches!(
             protocol::decode::<Response>(&result.response, &server)
@@ -332,7 +401,7 @@ mod tests {
         ));
         assert!(c.attempts.is_empty());
         assert!(c
-            .handle(&payload, "192.0.2.1:2000".parse().unwrap(), &sk)
+            .handle(&payload, "192.0.2.1:2000".parse().unwrap(), &sk, "")
             .is_err());
     }
 
@@ -348,11 +417,12 @@ mod tests {
             Action::Begin {
                 target: "easy".into(),
                 box_pk: box_::gen_keypair().0.as_ref().into(),
+                licence_key: String::new(),
             },
         )
         .unwrap();
         let (Reply::Ticket(ticket), Some(_)) =
-            c.apply(&req, protocol::now().unwrap(), &sk).unwrap()
+            c.apply(&req, protocol::now().unwrap(), &sk, "").unwrap()
         else {
             panic!()
         };
@@ -365,7 +435,7 @@ mod tests {
             },
         )
         .unwrap();
-        c.apply(&join, protocol::now().unwrap(), &sk).unwrap();
+        c.apply(&join, protocol::now().unwrap(), &sk, "").unwrap();
         for (id, values) in [
             ("easy", ["192.0.2.1:5000", "192.0.2.1:5000"]),
             ("hard", ["192.0.2.2:6000", "192.0.2.2:6001"]),
@@ -378,7 +448,7 @@ mod tests {
                 },
             )
             .unwrap();
-            c.apply(&prepare, protocol::now().unwrap(), &sk).unwrap();
+            c.apply(&prepare, protocol::now().unwrap(), &sk, "").unwrap();
         }
         assert!(matches!(
             c.plan(&session, "easy").unwrap(),
@@ -397,7 +467,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(c.apply(&forged, protocol::now().unwrap(), &sk).is_err());
+        assert!(c.apply(&forged, protocol::now().unwrap(), &sk, "").is_err());
         c.expire(protocol::now().unwrap() + crate::ATTEMPT_SECONDS);
         assert!(c.plan(&session, "easy").is_err());
     }
