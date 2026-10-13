@@ -101,7 +101,6 @@ async fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
     report("ready", serde_json::json!({"id":identity.id, "role":role}));
-    let started = Instant::now();
     let result = timeout(Duration::from_secs(120), async {
         let session = if role == "listen" {
             let mut buffer = [0u8; p2p::MAX_MESSAGE];
@@ -117,6 +116,7 @@ async fn main() -> Result<()> {
         } else {
             Session::begin(endpoint, identity.clone(), server, args.get(4).context("missing target id")?).await?.context("peer does not support native P2P")?
         };
+        let started = Instant::now();
         report("ticket", serde_json::json!({"session":session.ticket.session, "initiator":session.ticket.initiator}));
         let punched = session.punch(p2p::STUN_SERVER).await?;
         let deadline = punched.session.deadline;

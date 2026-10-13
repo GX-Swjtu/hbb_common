@@ -114,13 +114,14 @@ impl Session {
         server: sign::PublicKey,
         invite: Invite,
     ) -> Result<Self> {
+        let now = now()?;
         ensure!(
-            invite.target == identity.id && invite.expires > now()?,
+            invite.target == identity.id && invite.expires > now,
             "invalid native invitation"
         );
         let (pk, sk) = box_::gen_keypair();
         let deadline = Instant::now()
-            + Duration::from_secs(crate::ATTEMPT_SECONDS.min(invite.expires - now()?));
+            + Duration::from_secs(crate::ATTEMPT_SECONDS.min(invite.expires - now));
         let reply = rpc(
             endpoint,
             &identity,
@@ -203,7 +204,10 @@ impl Session {
                 plan.session == self.ticket.session,
                 "native plan session mismatch"
             );
-            let (socket, peer) = crate::hole::punch(socket, &plan, &self.secret, deadline).await?;
+            let (socket, peer) = tokio::select! {
+                result = crate::hole::punch(socket, &plan, &self.secret, deadline) => result?,
+                result = self.wait_for_cancellation() => return Err(result),
+            };
             log::info!(
                 "native-p2p Mode 2 confirmed, peer={peer}, sender={}",
                 plan.sender
@@ -215,6 +219,27 @@ impl Session {
             })
         })
         .await?
+    }
+
+    async fn wait_for_cancellation(&self) -> anyhow::Error {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            match rpc(
+                &self.endpoint,
+                &self.identity,
+                &self.server,
+                Action::Poll {
+                    session: self.ticket.session.clone(),
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            {
+                Ok(Reply::Plan(_)) => {}
+                Ok(_) => return anyhow::anyhow!("native peer cancelled or session expired"),
+                Err(error) => return error,
+            }
+        }
     }
 }
 
@@ -241,5 +266,33 @@ impl Drop for Session {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn old_server_is_abandoned_within_one_second() {
+        crate::init().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let old_server = tokio::spawn(async move {
+            let (_connection, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let (server, key) = sign::gen_keypair();
+        let started = Instant::now();
+        let result = Session::begin(
+            &endpoint,
+            Identity { id: "caller".into(), key },
+            server,
+            "old-client",
+        ).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(1400));
+        old_server.abort();
+        let _ = old_server.await;
     }
 }
