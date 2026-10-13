@@ -36,6 +36,13 @@ match that participant's observed signaling exit. Probe messages authenticate
 the session, request/response role and a random nonce with libsodium HMAC-SHA512/256.
 The normal RustDesk identity handshake still runs after KCP is established.
 
+Begin requests include the configured server public key inside the device-signed
+payload. A keyed hbbs rejects a missing or mismatched key before creating a
+session or sending an invitation, matching its existing punch admission policy.
+Capability withdrawal uses a signed version-0 advertisement; an unsigned legacy
+heartbeat cannot revoke a capability. Disabled records keep their bounded replay
+history until normal expiry, so replaying a withdrawal after re-enabling fails.
+
 One new attempt per device; at most 64 concurrent sessions and 4096 advertised
 devices per coordinator. Each device has 512 signed requests per 60 seconds.
 Sessions expire after 45 seconds; capabilities require recent heartbeats. A

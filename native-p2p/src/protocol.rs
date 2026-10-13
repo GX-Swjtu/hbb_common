@@ -35,6 +35,8 @@ pub enum Action {
     Begin {
         target: String,
         box_pk: Vec<u8>,
+        #[serde(default)]
+        licence_key: String,
     },
     Join {
         session: String,
