@@ -202,4 +202,31 @@ mod tests {
         bytes[50] ^= 1;
         assert!(verified(&bytes, &session, false, &key).is_none());
     }
+
+    #[tokio::test]
+    async fn deadline_and_cancellation_release_receiver_sockets() {
+        crate::init().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let plan = Plan {
+            session: crate::protocol::id(),
+            sender: false,
+            peer_addresses: vec![peer.local_addr().unwrap(); 2],
+        };
+        let secret = randombytes(32);
+        let expired = punch(socket.clone(), &plan, &secret, Instant::now() + Duration::from_millis(150)).await;
+        assert!(expired.is_err());
+        // JoinSet aborts readers on drop; let their destructors run before checking ownership.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&socket), 1);
+        let kept = socket.clone();
+        let task = tokio::spawn(async move {
+            punch(kept, &plan, &secret, Instant::now() + Duration::from_secs(30)).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&socket), 1);
+    }
 }
