@@ -141,8 +141,11 @@ async fn predict(
                 if peer.ip() != plan.peer_addresses[0].ip() { continue; }
                 if plan.sender {
                     if verified(&buffer[..n], &plan.session, true, &key) != Some(nonce.as_slice()) { continue; }
-                } else if let Some(nonce) = verified(&buffer[..n], &plan.session, false, &key) {
-                    let answer = packet(&plan.session, true, nonce, &key)?;
+                } else if let Some(peer_nonce) = verified(&buffer[..n], &plan.session, false, &key) {
+                    // Port prediction can include our own mapping behind a shared
+                    // public IP; an authenticated hairpin of our primer is not a peer.
+                    if peer_nonce == nonce.as_slice() { continue; }
+                    let answer = packet(&plan.session, true, peer_nonce, &key)?;
                     for _ in 0..3 {
                         socket.send_to(&answer, peer).await?;
                         timeout_at(deadline, sleep(Duration::from_millis(15))).await?;
@@ -308,8 +311,17 @@ mod tests {
         crate::init().unwrap();
         for mode in [Mode::Predict, Mode::Birthday] {
             for ttl in [7, 4, 0] {
-                let easy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-                let hard = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let mut neighbors = None;
+                for _ in 0..8 {
+                    let easy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let port = easy.local_addr().unwrap().port();
+                    if port == 65535 { continue; }
+                    if let Ok(hard) = UdpSocket::bind(("127.0.0.1", port + 1)).await {
+                        neighbors = Some((Arc::new(easy), Arc::new(hard)));
+                        break;
+                    }
+                }
+                let (easy, hard) = neighbors.expect("neighboring loopback ports available");
                 let easy_ttl = easy.ttl().unwrap();
                 let hard_ttl = hard.ttl().unwrap();
                 let mut earlier = hard.local_addr().unwrap();
@@ -330,6 +342,8 @@ mod tests {
                 let (a, b) = tokio::join!(punch(easy.clone(), &easy_plan, &secret, deadline), punch(hard.clone(), &hard_plan, &secret, deadline));
                 let (a, _) = a.unwrap();
                 let (b, _) = b.unwrap();
+                // EasyNAT's own port is deliberately inside the prediction range.
+                assert_ne!(a.local_addr().unwrap(), a.peer_addr().unwrap());
                 assert_eq!(easy.ttl().unwrap(), easy_ttl);
                 assert_eq!(hard.ttl().unwrap(), hard_ttl);
                 a.send(b"application-data").await.unwrap();
