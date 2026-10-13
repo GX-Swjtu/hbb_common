@@ -1,0 +1,5 @@
+The Mode 2 NAT traversal algorithm is adapted from frp v0.71.0:
+https://github.com/fatedier/frp/tree/v0.71.0/pkg/nathole
+Copyright 2023 The frp Authors, licensed under Apache-2.0.
+The Rust implementation uses session-authenticated packets and bounded task lifetimes.
+See LICENSE.frp for the upstream license.
