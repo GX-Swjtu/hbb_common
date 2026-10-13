@@ -161,7 +161,12 @@ mod tests {
         for (index, socket) in [first, other, cross_a, cross_b].into_iter().enumerate() {
             servers.spawn(async move {
                 let mut buf = [0u8; 1500];
-                let (_, source) = socket.recv_from(&mut buf).await.unwrap();
+                let source = loop {
+                    let (n, source) = socket.recv_from(&mut buf).await.unwrap();
+                    // Parallel loopback punch tests can probe these ports too.
+                    // Like a real STUN server, ignore packets of another protocol.
+                    if n == 20 && buf[..2] == [0, 1] && buf[4..8] == COOKIE { break source; }
+                };
                 let mut response = vec![1, 1, 0, 24];
                 response.extend_from_slice(&buf[4..20]);
                 response.extend_from_slice(&[0, 1, 0, 8, 0, 1]);
