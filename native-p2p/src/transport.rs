@@ -72,12 +72,14 @@ pub struct Session {
     server: sign::PublicKey,
     secret: Vec<u8>,
     pub deadline: Instant,
+    cancel_on_drop: bool,
 }
 
 pub struct Punched {
     pub socket: Arc<UdpSocket>,
     pub peer: SocketAddr,
     pub session: Session,
+    pub strategy: Option<crate::strategy::Strategy>,
 }
 
 impl Session {
@@ -156,6 +158,7 @@ impl Session {
             ticket.expires > now()? && ticket.session.len() == 32,
             "invalid native ticket"
         );
+        ensure!(matches!(ticket.strategies, 0 | crate::strategy::VERSION), "unsupported native strategies");
         let secret = sealedbox::open(&ticket.secret_box, pk, sk)
             .map_err(|_| anyhow::anyhow!("invalid sealed probe key"))?;
         ensure!(secret.len() == 32, "invalid probe key length");
@@ -166,17 +169,22 @@ impl Session {
             server,
             secret,
             deadline,
+            cancel_on_drop: true,
         })
     }
 
     pub async fn punch(self, stun_server: &str) -> Result<Punched> {
         let deadline = self.deadline;
         timeout_at(deadline, async move {
-            let (socket, addresses) = crate::stun::discover(stun_server).await?;
+            let (socket, addresses) = if self.ticket.strategies == crate::strategy::VERSION {
+                crate::stun::discover_profile(stun_server).await?
+            } else {
+                crate::stun::discover(stun_server).await?
+            };
             log::info!(
-                "native-p2p UDP observations: {:?}, stable={}",
+                "native-p2p UDP observations: {:?}, profile={:?}",
                 addresses,
-                mapping(&addresses)?
+                crate::strategy::classify(&addresses)?
             );
             let mut action = Action::Prepare {
                 session: self.ticket.session.clone(),
@@ -206,21 +214,47 @@ impl Session {
                 plan.session == self.ticket.session,
                 "native plan session mismatch"
             );
+            ensure!(plan.strategy.is_none() || self.ticket.strategies == crate::strategy::VERSION, "native strategy not negotiated");
+            log::info!("native-p2p selected strategy={:?}, sender={}", plan.strategy, plan.sender);
             let (socket, peer) = tokio::select! {
                 result = crate::hole::punch(socket, &plan, &self.secret, deadline) => result?,
                 result = self.wait_for_cancellation() => return Err(result),
             };
             log::info!(
-                "native-p2p Mode 2 confirmed, peer={peer}, sender={}",
-                plan.sender
+                "native-p2p UDP confirmed, peer={peer}, sender={}, strategy={:?}",
+                plan.sender, plan.strategy
             );
             Ok(Punched {
                 socket,
                 peer,
                 session: self,
+                strategy: plan.strategy,
             })
         })
         .await?
+    }
+
+    /// The KCP acceptor relinquishes cancellation ownership to the caller, which
+    /// still has to authenticate the device before reporting success. Server expiry
+    /// bounds this lease if the caller exits during that handshake.
+    pub fn handoff_to_caller(&mut self) {
+        if !self.ticket.initiator && self.ticket.strategies == crate::strategy::VERSION {
+            self.cancel_on_drop = false;
+        }
+    }
+
+    /// Call only after KCP and the existing RustDesk device-identity handshake.
+    /// The UDP-only diagnostic deliberately never rewards a strategy.
+    pub async fn confirm_authenticated(&self) -> Result<()> {
+        if self.ticket.strategies == 0 { return Ok(()); }
+        ensure!(self.ticket.initiator, "only native caller confirms authentication");
+        let reply = rpc(
+            &self.endpoint, &self.identity, &self.server,
+            Action::Confirm { session: self.ticket.session.clone() },
+            Duration::from_secs(1).min(self.deadline.saturating_duration_since(Instant::now())),
+        ).await?;
+        ensure!(matches!(reply, Reply::Closed), "native success report declined");
+        Ok(())
     }
 
     async fn wait_for_cancellation(&self) -> anyhow::Error {
@@ -247,6 +281,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if !self.cancel_on_drop { return; }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let endpoint = self.endpoint.clone();
             let identity = self.identity.clone();

@@ -1,4 +1,4 @@
-use crate::protocol::Plan;
+use crate::{protocol::Plan, strategy::{self, Mode}};
 use anyhow::{bail, ensure, Context, Result};
 use sodiumoxide::{
     crypto::auth,
@@ -53,7 +53,7 @@ pub async fn punch(
     deadline: Instant,
 ) -> Result<(Arc<UdpSocket>, SocketAddr)> {
     ensure!(
-        plan.session.len() == 32 && plan.peer_addresses.len() == 2,
+        plan.session.len() == 32 && (2..=4).contains(&plan.peer_addresses.len()),
         "invalid punch plan"
     );
     let key = auth::Key::from_slice(secret).context("invalid probe key")?;
@@ -65,10 +65,93 @@ pub async fn punch(
         "invalid peer addresses"
     );
     let deadline = deadline.min(Instant::now() + Duration::from_secs(38));
+    if let Some(strategy) = plan.strategy {
+        strategy.validate()?;
+        if strategy.mode == Mode::Predict {
+            return predict(socket, plan, key, deadline.min(Instant::now() + Duration::from_secs(8))).await;
+        }
+    }
     if plan.sender {
         sender(socket, plan, key, deadline).await
     } else {
         receiver(socket, plan, key, deadline).await
+    }
+}
+
+struct RestoreTtl<'a>(&'a UdpSocket, u32);
+
+impl Drop for RestoreTtl<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.set_ttl(self.1) {
+            log::trace!("native restore TTL: {error}");
+        }
+    }
+}
+
+async fn mapping_probe(socket: &UdpSocket, data: &[u8], targets: &[SocketAddr], ttl: u32) -> Result<()> {
+    let restore = if ttl > 0 {
+        let original = socket.ttl()?;
+        socket.set_ttl(ttl)?;
+        Some(RestoreTtl(socket, original))
+    } else { None };
+    for target in targets {
+        if let Err(error) = socket.send_to(data, target).await {
+            log::trace!("native mapping probe: {error}");
+        }
+    }
+    drop(restore);
+    Ok(())
+}
+
+async fn predict(
+    socket: Arc<UdpSocket>,
+    plan: &Plan,
+    key: auth::Key,
+    deadline: Instant,
+) -> Result<(Arc<UdpSocket>, SocketAddr)> {
+    let nonce = randombytes(16);
+    let data = packet(&plan.session, false, &nonce, &key)?;
+    let ttl = plan.strategy.context("prediction strategy absent")?.ttl;
+    if plan.sender {
+        // frp Mode 1 reverses Mode 2's roles: the HardNAT endpoint sends to EasyNAT.
+        timeout_at(deadline, sleep(Duration::from_secs(2))).await?;
+    } else {
+        for port in strategy::predicted_ports(&plan.peer_addresses)? {
+            let target = SocketAddr::new(plan.peer_addresses[0].ip(), port);
+            timeout_at(deadline, mapping_probe(&socket, &data, &[target], ttl)).await??;
+            timeout_at(deadline, sleep(Duration::from_millis(15))).await?;
+        }
+    }
+    let mut interval = tokio::time::interval(Duration::from_millis(200));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sent = 0;
+    let mut buffer = [0u8; 1500];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => bail!("Mode 1 timed out"),
+            _ = interval.tick(), if plan.sender && sent < 20 => {
+                mapping_probe(&socket, &data, &plan.peer_addresses, 0).await?;
+                sent += 1;
+            },
+            received = socket.recv_from(&mut buffer) => {
+                let (n, peer) = match received {
+                    Ok(value) => value,
+                    Err(error) => { log::trace!("native prediction receive: {error}"); sleep(Duration::from_millis(10)).await; continue; }
+                };
+                if peer.ip() != plan.peer_addresses[0].ip() { continue; }
+                if plan.sender {
+                    if verified(&buffer[..n], &plan.session, true, &key) != Some(nonce.as_slice()) { continue; }
+                } else if let Some(nonce) = verified(&buffer[..n], &plan.session, false, &key) {
+                    let answer = packet(&plan.session, true, nonce, &key)?;
+                    for _ in 0..3 {
+                        socket.send_to(&answer, peer).await?;
+                        timeout_at(deadline, sleep(Duration::from_millis(15))).await?;
+                    }
+                } else { continue; }
+                socket.connect(peer).await?;
+                return Ok((socket, peer));
+            }
+        }
     }
 }
 
@@ -126,18 +209,7 @@ async fn receiver(
     }
     let data = packet(&plan.session, false, &randombytes(16), &key)?;
     for socket in &sockets {
-        let original = socket.ttl()?;
-        socket.set_ttl(7)?;
-        let mut error = None;
-        for peer in &plan.peer_addresses {
-            if let Err(e) = socket.send_to(&data, peer).await {
-                error = Some(e);
-            }
-        }
-        socket.set_ttl(original)?;
-        if let Some(error) = error {
-            log::trace!("native mapping probe: {error}");
-        }
+        mapping_probe(socket, &data, &plan.peer_addresses[..2], plan.strategy.map_or(7, |s| s.ttl)).await?;
     }
     let mut readers = JoinSet::new();
     for socket in sockets {
@@ -212,6 +284,7 @@ mod tests {
             session: crate::protocol::id(),
             sender: false,
             peer_addresses: vec![peer.local_addr().unwrap(); 2],
+            strategy: None,
         };
         let secret = randombytes(32);
         let expired = punch(socket.clone(), &plan, &secret, Instant::now() + Duration::from_millis(150)).await;
@@ -228,5 +301,47 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(Arc::strong_count(&socket), 1);
+    }
+
+    #[tokio::test]
+    async fn both_modes_and_ttl_variants_keep_the_winning_socket_for_data() {
+        crate::init().unwrap();
+        for mode in [Mode::Predict, Mode::Birthday] {
+            for ttl in [7, 4, 0] {
+                let easy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let hard = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let easy_ttl = easy.ttl().unwrap();
+                let hard_ttl = hard.ttl().unwrap();
+                let mut earlier = hard.local_addr().unwrap();
+                earlier.set_port(earlier.port() - 1);
+                let session = crate::protocol::id();
+                let selected = Some(strategy::Strategy { mode, ttl });
+                let easy_plan = Plan {
+                    session: session.clone(), sender: mode == Mode::Birthday,
+                    peer_addresses: vec![earlier, hard.local_addr().unwrap(), hard.local_addr().unwrap()],
+                    strategy: selected,
+                };
+                let hard_plan = Plan {
+                    session, sender: mode == Mode::Predict,
+                    peer_addresses: vec![easy.local_addr().unwrap(); 3], strategy: selected,
+                };
+                let deadline = Instant::now() + Duration::from_secs(6);
+                let secret = randombytes(32);
+                let (a, b) = tokio::join!(punch(easy.clone(), &easy_plan, &secret, deadline), punch(hard.clone(), &hard_plan, &secret, deadline));
+                let (a, _) = a.unwrap();
+                let (b, _) = b.unwrap();
+                assert_eq!(easy.ttl().unwrap(), easy_ttl);
+                assert_eq!(hard.ttl().unwrap(), hard_ttl);
+                a.send(b"application-data").await.unwrap();
+                let mut buf = [0u8; 1500];
+                loop {
+                    let n = timeout_at(deadline, b.recv(&mut buf)).await.unwrap().unwrap();
+                    if &buf[..n] == b"application-data" { break; }
+                }
+                drop((a, b));
+                assert_eq!(Arc::strong_count(&easy), 1);
+                assert_eq!(Arc::strong_count(&hard), 1);
+            }
+        }
     }
 }

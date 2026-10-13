@@ -19,6 +19,16 @@ fn report(event: &str, value: serde_json::Value) {
     println!("{}", serde_json::json!({"event": event, "data": value}));
 }
 
+struct DiagnosticLog;
+
+impl log::Log for DiagnosticLog {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool { metadata.level() <= log::Level::Info }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) { report("log", serde_json::json!(record.args().to_string())); }
+    }
+    fn flush(&self) {}
+}
+
 async fn register(socket: &UdpSocket, identity: &Identity) -> Result<()> {
     let pk = identity.key.public_key();
     let mut message = RendezvousMessage::new();
@@ -45,6 +55,7 @@ async fn advertise(socket: &UdpSocket, identity: &Identity) -> Result<()> {
             &identity.id,
             Action::Advertise {
                 version: p2p::VERSION,
+                strategies: p2p::strategy::VERSION,
             },
         )?,
         &identity.key,
@@ -63,15 +74,17 @@ async fn advertise(socket: &UdpSocket, identity: &Identity) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     p2p::init()?;
+    log::set_logger(&DiagnosticLog).map_err(|_| anyhow::anyhow!("diagnostic logger already set"))?;
+    log::set_max_level(log::LevelFilter::Info);
     let args: Vec<String> = std::env::args().collect();
     let role = args.get(1).map(String::as_str).unwrap_or("help");
     if role == "discover" {
         let (socket, addresses) =
-            p2p::stun::discover(args.get(2).map(String::as_str).unwrap_or(p2p::STUN_SERVER))
+            p2p::stun::discover_profile(args.get(2).map(String::as_str).unwrap_or(p2p::STUN_SERVER))
                 .await?;
         report(
             "mapping",
-            serde_json::json!({"local":socket.local_addr()?, "observations":addresses, "stable":protocol::mapping(&addresses)?}),
+            serde_json::json!({"local":socket.local_addr()?, "observations":addresses, "profile":p2p::strategy::classify(&addresses)?}),
         );
         return Ok(());
     }
@@ -144,7 +157,7 @@ async fn main() -> Result<()> {
             }
             Ok::<(), anyhow::Error>(())
         }).await??;
-        report("verified", serde_json::json!({"peer":peer,"local":local,"elapsed_ms":started.elapsed().as_millis(),"transport":"authenticated-udp-direct"}));
+        report("verified", serde_json::json!({"peer":peer,"local":local,"elapsed_ms":started.elapsed().as_millis(),"transport":"authenticated-udp-direct","strategy":punched.strategy,"history_rewarded":false}));
         Ok::<(), anyhow::Error>(())
     }).await;
     tasks.abort_all();
