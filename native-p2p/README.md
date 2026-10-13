@@ -1,139 +1,143 @@
-# Native P2P v1
+# Native UDP punching
 
-An optional UDP traversal path for the RustDesk Windows/Linux forks. It does not
-replace RustDesk's KCP, device identity, login, confirmation or permission logic.
-Android/iOS/macOS do not link this crate through `hbb_common`; unsupported peers
-continue through the existing rendezvous path.
+An optional traversal path for the RustDesk Windows/Linux forks. It retains
+RustDesk's KCP, device identity, login, confirmation and permission checks.
+Android/iOS/macOS do not link this crate through `hbb_common` and keep the
+original connection flow. The algorithms are adapted from frp v0.71.0
+(`4a23aa181c1d7e28eecaa8216024ed753b9d27c8`); see `NOTICE` and `LICENSE.frp`.
+No frp executable is required.
 
-The implementation follows frp v0.71.0 Modes 1 and 2. See `NOTICE` and `LICENSE.frp` for
-the upstream algorithm references and license. No frp executable is used.
+## One capability
 
-## Components
+The only signed feature declaration is `capability="native-udp-punch"` with an
+`enabled` boolean. Both devices and the coordinator must support this exact
+capability before a session is issued. There are no strategy generation flags
+or separate V2 switch. `enable-native-p2p=N` disables the entire native attempt.
+Older experimental native clients/servers fall back to the original RustDesk
+connection flow, just like unsupported peers; they do not retain a separate
+fixed Mode 2 path. An old server's capability wait is at most one second.
 
-- `protocol`: versioned messages, device/server signatures and sealed probe keys.
-- `coordinator`: server capability registry, participant and exit validation,
-  per-device request quota and bounded sessions.
-- `stun`: two to four IPv4 mapping observations on one retained socket, using
-  `stun.easyvoip.com:3478` and its OTHER-ADDRESS/CHANGED-ADDRESS response.
-- `hole`: one EasyNAT and one HardNAT, independent of the remote-control direction.
-- `strategy`: conservative port prediction and bounded history of TTL/mode outcomes.
-- `transport`: signed hbbs RPC, the 45 second deadline and cancellation lease.
-- `native-p2p-probe`: the same production protocol/traversal code with a random
-  challenge echo instead of the RustDesk remote-desktop session.
+The existing protobuf envelope (`NativeP2pV1`, field 1000, envelope version 1)
+and registration fields 1000/1001 are retained to avoid another upstream schema
+change. That envelope version is not an additional capability. The signed JSON
+uses the domain `rustdesk-native-udp-punch\0`; old experiment signatures cannot
+be mistaken for the new capability. Tickets repeat the negotiated capability.
 
-Only additive protobuf fields are used: RegisterPeer fields 1000/1001 and the
-NativeP2pV1 rendezvous union field 1000. Legacy fields retain their meanings.
-The new field contains a bounded, signed JSON envelope, domain separated with
-`rustdesk-native-p2p-v1\0`. Version 1 is explicitly negotiated on both devices.
+## Modules and flow
 
-The signed advertisement additionally carries `strategies=1`. Only when both
-devices advertise it does hbbs add that field to tickets and a strategy to plans.
-Absent fields deserialize to the original fixed Mode 2 path and are omitted
-when serializing to older native clients (whose ticket/plan decoders reject
-unknown fields). New clients with an old hbbs also use the original two-sample
-discovery and Mode 2. The protobuf version and transport label remain v1.
+- `protocol` and `coordinator`: signed capability, participant admission,
+  sealed probe keys, replay/quota checks and one session lease per device.
+- `stun`: two to four distinct IPv4 destination observations using one retained
+  UDP socket and `stun.easyvoip.com:3478` plus its alternate endpoints.
+- `interfaces` and `candidates`: active physical IPv4 adapters, on-link LAN
+  filtering and authenticated TCP source-IP verification.
+- `strategy`: NAT evidence, five strategy families and bounded outcome scores.
+- `hole`: authenticated probes, shared budgets, TTL restoration and socket cleanup.
+- `transport`: bounded RPCs, preparation, polling and cancellation.
 
-## Adaptive strategies
+The mandatory two STUN destinations and optional crossed IP/port observations
+share six seconds; each optional observation has at most 500 ms. TCP NAT type
+never vetoes this independent UDP path. Prediction needs at least three valid
+observations for the same public IP, a port span of 1..5, and strictly increasing
+or decreasing ports. Alternating destination-specific pools are not predictable.
+This is a conservative heuristic, not proof that a gateway will allocate its next
+port deterministically.
 
-After the mandatory primary/alternate STUN bindings, enhanced clients try the
-two crossed IP/port destinations from the STUN response on the same socket.
-Each optional sample is capped at 500 ms, within the existing six-second STUN
-budget. Missing optional samples leave the mandatory observations usable.
-Public IP changes or a signaling/STUN exit mismatch still fail closed.
+Each endpoint can add at most four authenticated TCP source observations within
+a shared two-second budget. The server verifies the device signature and session
+membership before admitting an IP, and retains at most four public exits per
+participant, only for that session. STUN addresses alone never prove ownership.
+Unverified UDP exits are removed; an empty result fails back to the original
+connection flow. UDP-only egress that authenticated TCP cannot observe is an
+explicit coverage limit. Port deltas are never combined across public IPs.
 
-Mode 1 is eligible only with at least three distinct destination observations
-and a mapped port span of 1..5, following frp's heuristic conservatively. It is
-not proof of deterministic allocation. EasyNAT primes at most 21 ports around
-the last HardNAT observation, restricted to 1024..65534; HardNAT waits two seconds
-and sends at most 20 rounds to EasyNAT's candidates. No extra sockets are opened.
-The prediction window is eight seconds. Authenticated replies keep the actual
-winning socket, independent of which device initiated remote control.
+Each endpoint advertises at most eight physical-adapter RFC1918 candidates using
+the retained socket's port. The receiver only tries exact candidate endpoints in
+its own physical interface's directly connected subnet, excluding its own IPs,
+network and broadcast addresses. LAN probing is authenticated and limited to
+750 ms. TUN, loopback and virtual adapters are excluded by platform enumeration.
+A physical public interface matching the observed UDP IP and port is preferred
+as the Mode 0 receiver. Its endpoint must also pass TCP source verification.
 
-Mode 2 keeps the proven 256 extra sockets / 1000 distinct random ports / three
-second delay / 15 ms spacing. Both modes can prime mappings with TTL 7, TTL 4 or
-the OS TTL; the socket TTL is restored before normal transport. Mode 2 retains
-its 38-second window. All preparation, probing and KCP share the original
-45-second deadline. Each connection selects **one** mode/TTL, as in frp;
-failure returns to the original RustDesk connection/relay flow. A later cold
-connection can select another strategy, without repeated full punch windows.
+## Strategy families
 
-The hbbs history holds at most 1024 public network pairs for one hour, including
-their Easy/Hard roles and prediction eligibility, never a cached winning port.
-Selection costs one point, and a signed caller report after KCP plus the existing
-RustDesk device-identity handshake rewards two points (cap 10). The first choice
-is prediction/TTL 7 when eligible, otherwise Mode 2/TTL 7. An unsuccessful first
-prediction yields to Mode 2/TTL 7 on the next connection; further ties alternate
-the modes and TTLs. Scores bottom out at -10 and reset when all eligible choices
-are exhausted. Polled plans do not score again. A success report consumes the
-attempt, preventing repeated rewards; a responder cannot submit that report.
-The diagnostic UDP echo never rewards the history.
+| Mode | Eligibility | Behavior |
+| --- | --- | --- |
+| 0 / Direct | Both EasyNAT, or a physical public receiver | Ordinary mutual probes; both directions; receiver TTL 7, 4 or OS default; sender delay 0, 5 or 10 s. |
+| 1 / Predict | EasyNAT plus predictable HardNAT | HardNAT sender, immediate or 2 s delay; EasyNAT predicts at most 21 ports; receiver TTL 7, 4 or default. |
+| 2 / Birthday | EasyNAT plus HardNAT | EasyNAT waits 3 s then probes 1000 random targets; HardNAT opens 256 extra sockets; receiver TTL 7, 4 or default. |
+| 3 / BothPredict | Two predictable HardNATs | Both predict ports; both direction choices; receiver TTL 7, 4 or default. |
+| 4 / Mixed | Two HardNATs, at least one predictable | Predictable sender waits 3 s and probes random ports; receiver opens 256 extra sockets and predicts a radius of at most 2; TTL 7, 4 or default. |
 
-After KCP accept, an enhanced receiver leaves cancellation ownership with the
-caller until its identity handshake/report completes. Earlier failure still
-cancels immediately; server expiry cleans up a crashed caller within 45 seconds.
-The caller sends its bounded report asynchronously so reporting cannot turn an
-established authenticated transport into a failed connection. No legacy path,
-Android hook, KCP implementation, persistent tunnel or dual-HardNAT strategy is
-introduced by this extension.
+The 28 role/TTL/delay combinations follow the fixed reference version (Mode 4's
+code specifies 3 s despite an older 2 s comment). Two unpredictable HardNATs
+without a usable LAN path fall back. Only one strategy is selected per connection;
+there is no chain of full waiting windows or persistent retry tunnel.
 
-## Authentication and limits
+History stores at most 1024 network-profile pairs, expires after one hour, and
+never caches winning ports. Selection subtracts one point exactly once; only
+the caller, after KCP plus RustDesk's device-identity secure handshake, reports
+success for two points. Scores are bounded at -10..10 and reset after exhausting
+eligible choices. Polling does not penalize again; confirmation consumes the
+session, so it cannot be rewarded twice. Password/confirmation still follows the
+secure handshake normally. Diagnostic UDP or KCP echoes never reward history.
 
-The capability and each request are signed with the registered device Ed25519
-key. hbbs validates signatures, nonce freshness/reuse, the device's signaling
-exit and membership in the requested session. Tickets and invitations are signed
-by the configured hbbs key. A fresh 32-byte probe secret is delivered separately
-to both participants with libsodium sealed boxes. Candidate IPv4 addresses must
-match that participant's observed signaling exit. Probe messages authenticate
-the session, request/response role and a random nonce with libsodium HMAC-SHA512/256.
-The normal RustDesk identity handshake still runs after KCP is established.
+## Authentication and hard bounds
 
-Begin requests include the configured server public key inside the device-signed
-payload. A keyed hbbs rejects a missing or mismatched key before creating a
-session or sending an invitation, matching its existing punch admission policy.
-Capability withdrawal uses a signed version-0 advertisement; an unsigned legacy
-heartbeat cannot revoke a capability. Disabled records keep their bounded replay
-history until normal expiry, so replaying a withdrawal after re-enabling fails.
+Requests are signed with registered device Ed25519 keys. hbbs verifies freshness,
+nonce reuse, the server admission key and session membership. Server-signed
+tickets bind both device IDs and deliver one random 32-byte key through sealed
+boxes. UDP probes authenticate session, direction and nonce with HMAC-SHA512/256.
+Only authenticated responses from approved IPs (exact ports for LAN) may win.
+The winning socket remains open for KCP; losing tasks/sockets are cancelled.
 
-One new attempt per device; at most 64 concurrent sessions and 4096 advertised
-devices per coordinator. Each device has 512 signed requests per 60 seconds.
-Sessions expire after 45 seconds; capabilities require recent heartbeats. A
-cancel removes the session; a peer still punching checks for cancellation once
-per second with a one-second RPC timeout. Dropping a local attempt aborts its
-socket readers and sends a bounded best-effort cancel RPC. Server expiry covers
-crashes or loss of that RPC.
+- 45 s absolute attempt deadline, including preparation and KCP; LAN and WAN
+  share at most 38 s of probing, with at least 3 s reserved for KCP.
+- One attempt per device; at most 257 traversal sockets per endpoint.
+- 1000 unique random IP/port combinations shared across all exits, weighted by
+  observed UDP exit frequency; ports 1024..65534, approximately 15 ms apart.
+  Exits do not multiply the budget.
+- At most 8192 authenticated probe datagrams per endpoint/attempt, including
+  initial primers, LAN probes and replies; TTL always restored.
+- At most 64 server sessions, 4096 device capability records and 512 signed
+  requests per device per 60 s. Recent signed heartbeats are required.
 
-HardNAT uses its retained STUN socket plus 256 additional sockets, sends TTL 7
-probes to the EasyNAT candidates, then restores the socket TTL. EasyNAT waits
-three seconds and probes up to 1000 distinct ports in 1024..65534, approximately
-15 ms apart, using its original socket. Only authenticated replies from the
-expected public IPv4 address can win. Loser sockets/tasks are dropped. The
-38-second punch window and subsequent KCP setup share the 45-second total budget.
+Cancellation drops readers immediately and sends a bounded best-effort cancel
+RPC; peer cancellation polling is once per second, with a one-second RPC bound.
+After KCP accept the receiver hands cancellation ownership to the caller until
+its secure handshake completes. Session expiry covers crashes or lost cancels.
+Explicit proxy, WebSocket and forced-relay choices keep their original behavior.
+No media, UI, Android permission/JNI, relay data forwarding or upstream KCP code
+is changed by this expansion.
 
-This first version deliberately falls back for two HardNATs, two EasyNATs,
-inconsistent exits, failed STUN, IPv6-only paths or unavailable coordination.
-An old server's capability wait is at most one second. No background tunnel or
-upgrade of an already relayed session is implemented.
+## Diagnostics and validation
 
-## Build and diagnose
-
-From this `hbb_common` checkout:
+From the common checkout:
 
 ```text
-cargo test --manifest-path native-p2p/Cargo.toml
-cargo build --manifest-path native-p2p/Cargo.toml --bin native-p2p-probe
+cargo test --locked --manifest-path native-p2p/Cargo.toml
+cargo build --locked --manifest-path native-p2p/Cargo.toml --bin native-p2p-probe
 native-p2p-probe discover
 native-p2p-probe listen TEST_HOST:22116 TEST_SERVER_PUBLIC_KEY
 native-p2p-probe connect TEST_HOST:22116 TEST_SERVER_PUBLIC_KEY LISTENER_ID
 ```
 
-Start the listener first and use its emitted ID. IDs and private signing keys in
-the diagnostic are ephemeral. `verified` proves a bidirectional authenticated
-UDP exchange; it does **not** prove a RustDesk login, screen/input operation,
-file transfer, KCP stability or a connection-success rate.
+The UDP tool proves only authenticated UDP echo. The client's separate
+`tools/native-p2p/diagnostic` crate uses this same module and the production
+`KcpStream` source, validates server-signed peer keys and a fresh signed challenge,
+and verifies a 64 KiB KCP echo. Its `authenticated-kcp-diagnostic` result still
+is not a RustDesk desktop/password/permission acceptance result. Neither tool
+reports success to server scoring. Always start the receiver before the caller.
 
-Keep TUN enabled during the target-network tests. Process/domain DIRECT rules
-must be verified using the observed UDP exit and actual connections; a rule name
-alone is not proof of the physical path. No Android-specific TUN rules are needed.
+`tools/native-p2p/nat-lab.py` creates uniquely named Linux network namespaces,
+private hbbs/STUN instances, real SNAT/conntrack and optional netem loss. It never
+changes host routing/firewall. For LAN/public-interface fixtures only, the
+standalone diagnostic calls `Session::punch_on` with explicitly reported veth
+addresses; RustDesk always calls `punch` to enumerate actual physical adapters.
+Fixtures validate candidate handling, not hardware-adapter discovery.
 
-The client and server retain their own `hbb_common` baselines. Apply only this
-feature's commits to both branches; do not merge one baseline into the other.
+Keep TUN enabled on real endpoints. Verify actual mappings, transport, desktop
+frames and relay traffic; a DIRECT rule name or a single UDP packet is not proof
+of P2P remote control. Real Windows acceptance, Android builds and Android real
+device tests must be reported separately. Keep the client/server common baselines
+separate and cherry-pick only this feature patch between them.

@@ -404,6 +404,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "libc",
  "log",
  "protobuf",
  "protobuf-codegen",
@@ -412,6 +413,7 @@ dependencies = [
  "sodiumoxide",
  "tokio",
  "tokio-util",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

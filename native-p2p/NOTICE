@@ -1,4 +1,4 @@
-The Mode 1/2 traversal algorithms, small-port-span heuristic and bounded
+The Mode 0/1/2/3/4 role, TTL and delay families, port-span heuristic and bounded
 success scoring are adapted from frp v0.71.0 (commit 4a23aa181c1d7e28eecaa8216024ed753b9d27c8):
 https://github.com/fatedier/frp/tree/v0.71.0/pkg/nathole
 Copyright 2023 The frp Authors, licensed under Apache-2.0.

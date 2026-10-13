@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const DOMAIN: &[u8] = b"rustdesk-native-p2p-v1\0";
+const DOMAIN: &[u8] = b"rustdesk-native-udp-punch\0";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,9 +30,8 @@ pub struct Request {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Action {
     Advertise {
-        version: u32,
-        #[serde(default, skip_serializing_if = "is_zero")]
-        strategies: u32,
+        capability: String,
+        enabled: bool,
     },
     Begin {
         target: String,
@@ -46,7 +45,7 @@ pub enum Action {
     },
     Prepare {
         session: String,
-        addresses: Vec<SocketAddr>,
+        candidates: crate::candidates::Candidates,
     },
     Poll {
         session: String,
@@ -55,6 +54,9 @@ pub enum Action {
         session: String,
     },
     Confirm {
+        session: String,
+    },
+    Observe {
         session: String,
     },
 }
@@ -75,6 +77,7 @@ pub enum Reply {
     Plan(Plan),
     Closed,
     Error(String),
+    Observed(std::net::IpAddr),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -86,8 +89,7 @@ pub struct Ticket {
     pub peer_id: String,
     pub signed_peer: Vec<u8>,
     pub initiator: bool,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub strategies: u32,
+    pub capability: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -104,12 +106,10 @@ pub struct Invite {
 pub struct Plan {
     pub session: String,
     pub sender: bool,
-    pub peer_addresses: Vec<SocketAddr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<crate::strategy::Strategy>,
+    pub peer: crate::candidates::Candidates,
+    pub behavior: crate::strategy::Behavior,
+    pub lan_only: bool,
 }
-
-fn is_zero(value: &u32) -> bool { *value == 0 }
 
 pub fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
@@ -204,6 +204,15 @@ pub fn mapping(addresses: &[SocketAddr]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticket_requires_the_single_capability_and_no_test_generation_fields() {
+        let old = serde_json::json!({"session": id(), "expires": now().unwrap() + 45,
+            "secret_box": [], "peer_id": "old", "signed_peer": [], "initiator": true, "strategies": 1});
+        assert!(serde_json::from_value::<Ticket>(old).is_err());
+        let value = serde_json::to_value(Action::Advertise { capability: crate::CAPABILITY.into(), enabled: true }).unwrap();
+        assert_eq!(value, serde_json::json!({"Advertise": {"capability": "native-udp-punch", "enabled": true}}));
+    }
 
     #[test]
     fn signed_requests_reject_tampering_and_expiration() {
