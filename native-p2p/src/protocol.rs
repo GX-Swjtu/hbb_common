@@ -31,6 +31,8 @@ pub struct Request {
 pub enum Action {
     Advertise {
         version: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        strategies: u32,
     },
     Begin {
         target: String,
@@ -50,6 +52,9 @@ pub enum Action {
         session: String,
     },
     Cancel {
+        session: String,
+    },
+    Confirm {
         session: String,
     },
 }
@@ -81,6 +86,8 @@ pub struct Ticket {
     pub peer_id: String,
     pub signed_peer: Vec<u8>,
     pub initiator: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub strategies: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,7 +105,11 @@ pub struct Plan {
     pub session: String,
     pub sender: bool,
     pub peer_addresses: Vec<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<crate::strategy::Strategy>,
 }
+
+fn is_zero(value: &u32) -> bool { *value == 0 }
 
 pub fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())

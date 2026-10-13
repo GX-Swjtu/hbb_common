@@ -1,5 +1,8 @@
 //! Bounded, authenticated coordination; no legacy rendezvous state is changed.
-use crate::protocol::{self, Action, Invite, Plan, Reply, Request, Response, Ticket};
+use crate::{
+    protocol::{self, Action, Invite, Plan, Reply, Request, Response, Ticket},
+    strategy::{self, History, Mode, Network, Strategy},
+};
 use anyhow::{bail, ensure, Context, Result};
 use sodiumoxide::{crypto::sign, randombytes::randombytes};
 use std::{
@@ -21,6 +24,7 @@ pub struct Device {
 struct Capability {
     device: Device,
     enabled: bool,
+    strategies: u32,
     seen: u64,
     requests: VecDeque<(Vec<u8>, u64)>,
 }
@@ -32,12 +36,15 @@ struct Attempt {
     secret: Vec<u8>,
     joined: bool,
     addresses: HashMap<String, Vec<SocketAddr>>,
+    strategies: u32,
+    selection: Option<(Network, Strategy)>,
 }
 
 #[derive(Default)]
 pub struct Coordinator {
     devices: HashMap<String, Capability>,
     attempts: HashMap<String, Attempt>,
+    history: History,
 }
 
 pub struct Outcome {
@@ -49,6 +56,7 @@ impl Coordinator {
     pub fn expire(&mut self, now: u64) {
         self.attempts.retain(|_, s| s.expires > now);
         self.devices.retain(|_, d| now.saturating_sub(d.seen) < 60);
+        self.history.expire(now);
     }
 
     pub fn advertise(&mut self, device: Device, payload: &[u8]) -> Result<()> {
@@ -59,24 +67,30 @@ impl Coordinator {
                 && matches!(
                     request.action,
                     Action::Advertise {
-                        version: 0 | crate::VERSION
+                        version: 0 | crate::VERSION, ..
                     }
                 ),
             "invalid capability"
         );
-        let enabled = matches!(request.action, Action::Advertise { version: crate::VERSION });
+        let enabled = matches!(request.action, Action::Advertise { version: crate::VERSION, .. });
+        let strategies = match request.action {
+            Action::Advertise { strategies: strategy::VERSION, .. } if enabled => strategy::VERSION,
+            _ => 0,
+        };
         let now = protocol::now()?;
         self.expire(now);
         if let Some(cap) = self.devices.get_mut(&device.id) {
             Self::consume(cap, &request, now)?;
             cap.device = device;
             cap.enabled = enabled;
+            cap.strategies = strategies;
             cap.seen = now;
         } else {
             ensure!(self.devices.len() < MAX_DEVICES, "native device limit");
             let mut cap = Capability {
                 device,
                 enabled,
+                strategies,
                 seen: now,
                 requests: VecDeque::new(),
             };
@@ -170,6 +184,10 @@ impl Coordinator {
                 let session = protocol::id();
                 let secret = randombytes(32);
                 let expires = now + crate::ATTEMPT_SECONDS;
+                let strategies = if peer.strategies == strategy::VERSION
+                    && self.devices.get(&request.id).is_some_and(|d| d.strategies == strategy::VERSION) {
+                    strategy::VERSION
+                } else { 0 };
                 let ticket = Ticket {
                     session: session.clone(),
                     expires,
@@ -177,6 +195,7 @@ impl Coordinator {
                     peer_id: target.clone(),
                     signed_peer: peer.device.signed_key.clone(),
                     initiator: true,
+                    strategies,
                 };
                 let invite = protocol::encode(
                     &Invite {
@@ -197,6 +216,8 @@ impl Coordinator {
                         secret,
                         joined: false,
                         addresses: HashMap::new(),
+                        strategies,
+                        selection: None,
                     },
                 );
                 Ok((Reply::Ticket(ticket), Some((address, invite))))
@@ -215,12 +236,13 @@ impl Coordinator {
                     peer_id: s.from.clone(),
                     signed_peer: peer.device.signed_key.clone(),
                     initiator: false,
+                    strategies: s.strategies,
                 };
                 s.joined = true;
                 Ok((Reply::Ticket(ticket), None))
             }
             Action::Prepare { session, addresses } => {
-                protocol::mapping(addresses)?;
+                strategy::classify(addresses)?;
                 let cap = self
                     .devices
                     .get(&request.id)
@@ -237,14 +259,24 @@ impl Coordinator {
                     request.id == s.from || (request.id == s.target && s.joined),
                     "invalid native participant"
                 );
+                ensure!(s.strategies == strategy::VERSION || addresses.len() == 2, "legacy native candidates require two observations");
                 ensure!(
                     !s.addresses.contains_key(&request.id),
                     "native candidates already submitted"
                 );
                 s.addresses.insert(request.id.clone(), addresses.clone());
-                Ok((self.plan(session, &request.id)?, None))
+                Ok((self.plan(session, &request.id, now)?, None))
             }
-            Action::Poll { session } => Ok((self.plan(session, &request.id)?, None)),
+            Action::Poll { session } => Ok((self.plan(session, &request.id, now)?, None)),
+            Action::Confirm { session } => {
+                let s = self.attempts.get(session).context("native session expired")?;
+                ensure!(request.id == s.from, "only the authenticated KCP caller reports success");
+                let (network, strategy) = s.selection.as_ref().context("no negotiated native strategy")?;
+                self.history.confirmed(network, *strategy, now);
+                // Removing the attempt also makes a second signed report ineffective.
+                self.attempts.remove(session);
+                Ok((Reply::Closed, None))
+            }
             Action::Cancel { session } => {
                 if let Some(s) = self.attempts.get(session) {
                     ensure!(
@@ -259,10 +291,10 @@ impl Coordinator {
         }
     }
 
-    fn plan(&self, session: &str, id: &str) -> Result<Reply> {
+    fn plan(&mut self, session: &str, id: &str, now: u64) -> Result<Reply> {
         let s = self
             .attempts
-            .get(session)
+            .get_mut(session)
             .context("native session expired")?;
         ensure!(id == s.from || id == s.target, "invalid native participant");
         if s.addresses.len() != 2 {
@@ -274,15 +306,23 @@ impl Coordinator {
             .addresses
             .get(peer_id)
             .context("native peer candidates absent")?;
-        let sender = protocol::mapping(own)?;
+        let easy = strategy::classify(own)?.easy;
         ensure!(
-            sender != protocol::mapping(peer)?,
-            "Mode 2 requires one EasyNAT and one HardNAT"
+            easy != strategy::classify(peer)?.easy,
+            "native strategies require one EasyNAT and one HardNAT"
         );
+        if s.strategies == strategy::VERSION && s.selection.is_none() {
+            let network = Network::new(own, peer)?;
+            let selected = self.history.select(&network, now);
+            s.selection = Some((network, selected));
+        }
+        let strategy = s.selection.as_ref().map(|(_, strategy)| *strategy);
+        let sender = if strategy.is_some_and(|s| s.mode == Mode::Predict) { !easy } else { easy };
         Ok(Reply::Plan(Plan {
             session: session.into(),
             sender,
             peer_addresses: peer.clone(),
+            strategy,
         }))
     }
 }
@@ -293,11 +333,16 @@ mod tests {
     use sodiumoxide::crypto::box_;
 
     fn register(c: &mut Coordinator, id: &str, address: &str) -> sign::SecretKey {
+        register_with_strategies(c, id, address, 0)
+    }
+
+    fn register_with_strategies(c: &mut Coordinator, id: &str, address: &str, strategies: u32) -> sign::SecretKey {
         let (pk, sk) = sign::gen_keypair();
         let r = protocol::request(
             id,
             Action::Advertise {
                 version: crate::VERSION,
+                strategies,
             },
         )
         .unwrap();
@@ -361,14 +406,14 @@ mod tests {
         }).unwrap();
         let (Reply::Ticket(ticket), _) = c.apply(&begin, protocol::now().unwrap(), &server, "").unwrap()
         else { panic!("expected ticket"); };
-        let off = protocol::request("target", Action::Advertise { version: 0 }).unwrap();
+        let off = protocol::request("target", Action::Advertise { version: 0, strategies: 0 }).unwrap();
         assert!(c.advertise(device(), &protocol::encode(&off, &caller).unwrap()).is_err());
-        assert!(matches!(c.plan(&ticket.session, "caller").unwrap(), Reply::Waiting));
+        assert!(matches!(c.plan(&ticket.session, "caller", protocol::now().unwrap()).unwrap(), Reply::Waiting));
         let withdrawal = protocol::encode(&off, &target).unwrap();
         c.advertise(device(), &withdrawal).unwrap();
-        assert!(c.plan(&ticket.session, "caller").is_err());
+        assert!(c.plan(&ticket.session, "caller", protocol::now().unwrap()).is_err());
         assert!(matches!(c.apply(&begin, protocol::now().unwrap(), &server, "").unwrap().0, Reply::Unsupported));
-        let on = protocol::request("target", Action::Advertise { version: crate::VERSION }).unwrap();
+        let on = protocol::request("target", Action::Advertise { version: crate::VERSION, strategies: 0 }).unwrap();
         c.advertise(device(), &protocol::encode(&on, &target).unwrap()).unwrap();
         assert!(c.advertise(device(), &withdrawal).is_err());
         assert!(matches!(c.apply(&begin, protocol::now().unwrap(), &server, "").unwrap().0, Reply::Ticket(_)));
@@ -451,14 +496,14 @@ mod tests {
             c.apply(&prepare, protocol::now().unwrap(), &sk, "").unwrap();
         }
         assert!(matches!(
-            c.plan(&session, "easy").unwrap(),
+            c.plan(&session, "easy", protocol::now().unwrap()).unwrap(),
             Reply::Plan(Plan { sender: true, .. })
         ));
         assert!(matches!(
-            c.plan(&session, "hard").unwrap(),
+            c.plan(&session, "hard", protocol::now().unwrap()).unwrap(),
             Reply::Plan(Plan { sender: false, .. })
         ));
-        assert!(c.plan(&session, "unrelated").is_err());
+        assert!(c.plan(&session, "unrelated", protocol::now().unwrap()).is_err());
         let forged = protocol::request(
             "easy",
             Action::Prepare {
@@ -469,6 +514,58 @@ mod tests {
         .unwrap();
         assert!(c.apply(&forged, protocol::now().unwrap(), &sk, "").is_err());
         c.expire(protocol::now().unwrap() + crate::ATTEMPT_SECONDS);
-        assert!(c.plan(&session, "easy").is_err());
+        assert!(c.plan(&session, "easy", protocol::now().unwrap()).is_err());
+    }
+
+    #[test]
+    fn strategies_require_both_capabilities_and_confirmation_is_caller_only_once() {
+        crate::init().unwrap();
+        let (_, server) = sign::gen_keypair();
+        let now = protocol::now().unwrap();
+        for (a, b) in [(0, 1), (1, 0), (1, 1)] {
+            let mut c = Coordinator::default();
+            let _easy = register_with_strategies(&mut c, "easy", "192.0.2.1:1000", a);
+            let _hard = register_with_strategies(&mut c, "hard", "192.0.2.2:1000", b);
+            let begin = protocol::request("easy", Action::Begin {
+                target: "hard".into(), box_pk: box_::gen_keypair().0.as_ref().into(), licence_key: String::new(),
+            }).unwrap();
+            let (Reply::Ticket(ticket), _) = c.apply(&begin, now, &server, "").unwrap() else { panic!() };
+            let enhanced = a == 1 && b == 1;
+            assert_eq!(ticket.strategies == 1, enhanced);
+            if !enhanced { assert!(serde_json::to_value(&ticket).unwrap().get("strategies").is_none()); }
+            let join = protocol::request("hard", Action::Join {
+                session: ticket.session.clone(), box_pk: box_::gen_keypair().0.as_ref().into(),
+            }).unwrap();
+            c.apply(&join, now, &server, "").unwrap();
+            let confirm = protocol::request("easy", Action::Confirm { session: ticket.session.clone() }).unwrap();
+            assert!(c.apply(&confirm, now, &server, "").is_err());
+            for (id, candidates) in [
+                ("easy", ["192.0.2.1:5000", "192.0.2.1:5000", "192.0.2.1:5000"]),
+                ("hard", ["192.0.2.2:6000", "192.0.2.2:6001", "192.0.2.2:6002"]),
+            ] {
+                let prepare = protocol::request(id, Action::Prepare {
+                    session: ticket.session.clone(),
+                    addresses: candidates[..if enhanced { 3 } else { 2 }].iter().map(|s| s.parse().unwrap()).collect(),
+                }).unwrap();
+                c.apply(&prepare, now, &server, "").unwrap();
+            }
+            let Reply::Plan(first) = c.plan(&ticket.session, "easy", now).unwrap() else { panic!() };
+            assert_eq!(first.sender, !enhanced);
+            assert_eq!(first.strategy.is_some(), enhanced);
+            if !enhanced {
+                assert!(serde_json::to_value(&first).unwrap().get("strategy").is_none());
+                assert!(c.apply(&confirm, now, &server, "").is_err());
+                continue;
+            }
+            for _ in 0..5 {
+                let Reply::Plan(other) = c.plan(&ticket.session, "hard", now).unwrap() else { panic!() };
+                assert_eq!(other.strategy, first.strategy);
+                assert_ne!(other.sender, first.sender);
+            }
+            let wrong = protocol::request("hard", Action::Confirm { session: ticket.session.clone() }).unwrap();
+            assert!(c.apply(&wrong, now, &server, "").is_err());
+            assert!(matches!(c.apply(&confirm, now, &server, "").unwrap().0, Reply::Closed));
+            assert!(c.apply(&confirm, now, &server, "").is_err());
+        }
     }
 }

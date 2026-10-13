@@ -3,6 +3,7 @@ pub mod coordinator;
 pub mod hole;
 pub mod protocol;
 pub mod stun;
+pub mod strategy;
 pub mod transport;
 
 #[path = "../../src/bytes_codec.rs"]

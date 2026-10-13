@@ -13,6 +13,14 @@ use tokio::{
 const COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 
 pub async fn discover(server: &str) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
+    discover_inner(server, false).await
+}
+
+pub async fn discover_profile(server: &str) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
+    discover_inner(server, true).await
+}
+
+async fn discover_inner(server: &str, characterize: bool) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
     let endpoint = tokio::time::timeout(Duration::from_secs(1), tokio::net::lookup_host(server))
         .await??
         .find(SocketAddr::is_ipv4)
@@ -23,7 +31,21 @@ pub async fn discover(server: &str) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)>
     let other = other.context("STUN must supply OTHER-ADDRESS or CHANGED-ADDRESS")?;
     ensure!(other != endpoint, "STUN alternate endpoint must differ");
     let (second, _) = binding(&socket, other, deadline).await?;
-    Ok((socket, vec![first, second]))
+    let mut addresses = vec![first, second];
+    if characterize && endpoint.ip() != other.ip() && endpoint.port() != other.port() {
+        // RFC 5780's two alternate IP/port combinations provide fresh destinations.
+        // Repeating a binding to the same destination would not sample NAT allocation.
+        // Optional samples never turn a working two-observation discovery into failure.
+        for target in [SocketAddr::new(endpoint.ip(), other.port()), SocketAddr::new(other.ip(), endpoint.port())] {
+            let extra_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+            if Instant::now() >= extra_deadline { break; }
+            match binding(&socket, target, extra_deadline).await {
+                Ok((mapped, _)) => addresses.push(mapped),
+                Err(error) => log::trace!("optional UDP characterization: {error}"),
+            }
+        }
+    }
+    Ok((socket, addresses))
 }
 
 async fn binding(
@@ -124,5 +146,38 @@ mod tests {
         assert_eq!(parse(&data).unwrap(), ("192.0.2.1:5000".parse().unwrap(), Some("192.0.2.2:3479".parse().unwrap())));
         data.pop();
         assert!(parse(&data).is_err());
+    }
+
+    #[tokio::test]
+    async fn characterization_uses_distinct_destinations_without_rebinding() {
+        crate::init().unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let a = first.local_addr().unwrap();
+        let b = other.local_addr().unwrap();
+        let cross_a = UdpSocket::bind(SocketAddr::new(a.ip(), b.port())).await.unwrap();
+        let cross_b = UdpSocket::bind(SocketAddr::new(b.ip(), a.port())).await.unwrap();
+        let mut servers = tokio::task::JoinSet::new();
+        for (index, socket) in [first, other, cross_a, cross_b].into_iter().enumerate() {
+            servers.spawn(async move {
+                let mut buf = [0u8; 1500];
+                let (_, source) = socket.recv_from(&mut buf).await.unwrap();
+                let mut response = vec![1, 1, 0, 24];
+                response.extend_from_slice(&buf[4..20]);
+                response.extend_from_slice(&[0, 1, 0, 8, 0, 1]);
+                response.extend_from_slice(&(5000 + index as u16).to_be_bytes());
+                response.extend_from_slice(&[192, 0, 2, 1]);
+                response.extend_from_slice(&[0x80, 0x2c, 0, 8, 0, 1]);
+                response.extend_from_slice(&b.port().to_be_bytes());
+                response.extend_from_slice(&[127, 0, 0, 2]);
+                socket.send_to(&response, source).await.unwrap();
+                source.port()
+            });
+        }
+        let (socket, observed) = discover_profile(&a.to_string()).await.unwrap();
+        assert_eq!(observed.iter().map(SocketAddr::port).collect::<Vec<_>>(), vec![5000, 5001, 5002, 5003]);
+        while let Some(source) = servers.join_next().await {
+            assert_eq!(source.unwrap(), socket.local_addr().unwrap().port());
+        }
     }
 }
