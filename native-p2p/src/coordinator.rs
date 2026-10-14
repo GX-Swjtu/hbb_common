@@ -112,8 +112,16 @@ impl Coordinator {
         match &request.action {
             Action::Begin { target, box_pk, licence_key: supplied } => {
                 ensure!(licence_key.is_empty() || supplied == licence_key, "native server key mismatch");
-                let Some(peer) = self.devices.get(target) else { return Ok((Reply::Unsupported, None)); };
-                if !peer.enabled || now.saturating_sub(peer.seen) > 30 || *target == request.id { return Ok((Reply::Unsupported, None)); }
+                let peer = self.devices.get(target).context("native peer capability is unknown; waiting for registration")?;
+                ensure!(now.saturating_sub(peer.seen) <= 30, "native peer registration expired; waiting for refresh");
+                if !peer.enabled || *target == request.id {
+                    return Ok((Reply::Error(crate::progress::Reason {
+                        code: "unsupported".into(),
+                        message: if !peer.enabled { "Native P2P is disabled on the peer" }
+                            else { "Native P2P cannot connect a device to itself" }.into(),
+                        local: None, peer: None,
+                    }.encode()), None));
+                }
                 ensure!(self.attempts.len() < MAX_SESSIONS, "native session limit");
                 ensure!(!self.attempts.values().any(|s| [&s.from, &s.target].iter().any(|id| **id == request.id || **id == *target)), "native device busy");
                 let session = protocol::id();
