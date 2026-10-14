@@ -22,14 +22,33 @@
     }
 
     #[test]
-    fn only_the_single_capability_enables_attempts_and_disabled_or_old_peers_do_not_wait() {
+    fn unavailable_capability_can_recover_after_registration() {
+        crate::init().unwrap();
+        for age in [None, Some(31), Some(61)] {
+            let mut c = Coordinator::default();
+            let (_, server) = sign::gen_keypair();
+            let caller = register(&mut c, "caller", "192.0.2.1", true);
+            if let Some(age) = age {
+                let _ = register(&mut c, "target", "198.51.100.1", true);
+                c.devices.get_mut("target").unwrap().seen = protocol::now().unwrap() - age;
+            }
+            let reply = call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", begin("target")).unwrap();
+            assert!(matches!(reply, Reply::Error(_)), "unavailable capability is not an explicit refusal");
+            let _ = register(&mut c, "target", "198.51.100.1", true);
+            assert!(matches!(call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", begin("target")).unwrap(), Reply::Ticket(_)));
+        }
+    }
+
+    #[test]
+    fn only_the_single_capability_enables_attempts_and_explicit_refusal_is_signed() {
         crate::init().unwrap();
         let mut c = Coordinator::default();
         let (_, server) = sign::gen_keypair();
         let caller = register(&mut c, "caller", "192.0.2.1", true);
         let target = register(&mut c, "target", "198.51.100.1", false);
-        for peer in ["android", "old-client", "target"] {
-            assert!(matches!(call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", begin(peer)).unwrap(), Reply::Unsupported));
+        for peer in ["target", "caller"] {
+            let Reply::Error(error) = call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", begin(peer)).unwrap() else { panic!("expected explicit refusal"); };
+            assert_eq!(crate::progress::Reason::decode(&error).unwrap().code, "unsupported");
             assert!(c.attempts.is_empty());
         }
         let device = || Device { id: "target".into(), key: target.public_key(), signed_key: vec![], address: "198.51.100.1:1000".parse().unwrap() };
