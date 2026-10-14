@@ -192,7 +192,11 @@ impl Coordinator {
             let behavior = match self.history.select(&network, now) {
                 Ok(b) => b,
                 Err(_) if s.prepared.values().all(|(c, _)| !c.local.is_empty()) => Behavior { mode: Mode::Direct, ttl: 0, delay_ms: 0, reversed: false },
-                Err(e) => return Err(e),
+                Err(e) => return Ok(Reply::Error(crate::progress::Reason {
+                    code: "no_strategy".into(), message: e.to_string(),
+                    local: s.prepared.get(id).map(|v| v.0.clone()),
+                    peer: s.prepared.iter().find(|(other, _)| other.as_str() != id).map(|(_, v)| v.0.clone()),
+                }.encode())),
             };
             s.selected = Some((network, behavior));
         }

@@ -1,16 +1,25 @@
-use crate::{candidates::{self, Interface}, probe_packet::{packet, verified}, strategy::{self, Behavior, Mode}, protocol::Plan, MAX_PACKETS, RANDOM_TARGETS};
+use crate::{candidates::{self, Interface}, probe_packet::{packet, verified}, strategy::{self, Behavior, Mode}, protocol::Plan, progress::{Observer, Progress, report}, MAX_PACKETS, RANDOM_TARGETS};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use anyhow::{bail, ensure, Context, Result};
 use sodiumoxide::{crypto::auth, randombytes::{randombytes, randombytes_uniform}};
 use std::{collections::HashSet, net::{IpAddr, SocketAddr}, sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}}, time::Duration};
-use tokio::{net::UdpSocket, task::JoinSet, time::{sleep, timeout_at, Instant}};
+use tokio::{net::UdpSocket, time::{sleep, timeout_at, Instant}};
 
 #[derive(Default)]
-pub struct Budget(AtomicUsize);
+pub struct Budget {
+    sent: AtomicUsize,
+    authenticated: AtomicUsize,
+    sockets: AtomicUsize,
+    observer: Observer,
+}
 impl Budget {
-    pub fn sent(&self) -> usize { self.0.load(Ordering::Relaxed) }
+    pub fn sent(&self) -> usize { self.sent.load(Ordering::Relaxed) }
+    fn report(&self) {
+        report(&self.observer, Progress::Probes { sent: self.sent(), authenticated: self.authenticated.load(Ordering::Relaxed), sockets: self.sockets.load(Ordering::Relaxed) });
+    }
     fn take(&self) -> Result<()> {
-        self.0.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_PACKETS).then_some(n + 1))
-            .map(|_| ()).map_err(|_| anyhow::anyhow!("native UDP packet budget exhausted"))
+        self.sent.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_PACKETS).then_some(n + 1))
+            .map(|n| { if n % 16 == 0 { self.report(); } }).map_err(|_| anyhow::anyhow!("native UDP packet budget exhausted"))
     }
 }
 
@@ -46,13 +55,20 @@ pub async fn punch(
     socket: Arc<UdpSocket>, session: &str, sender: bool, plan: &Plan, secret: &[u8],
     interfaces: &[Interface], deadline: Instant,
 ) -> Result<(Arc<UdpSocket>, SocketAddr)> {
+    punch_observed(socket, session, sender, plan, secret, interfaces, deadline, None).await
+}
+
+pub async fn punch_observed(
+    socket: Arc<UdpSocket>, session: &str, sender: bool, plan: &Plan, secret: &[u8],
+    interfaces: &[Interface], deadline: Instant, observer: Observer,
+) -> Result<(Arc<UdpSocket>, SocketAddr)> {
     ensure!(session.len() == 32, "invalid native UDP session");
     plan.peer.validate()?;
     plan.behavior.validate()?;
     let key = auth::Key::from_slice(secret).context("invalid probe key")?;
     let nonce = randombytes(16);
     let data = packet(session, false, &nonce, &key)?;
-    let budget = Arc::new(Budget::default());
+    let budget = Arc::new(Budget { observer, sockets: AtomicUsize::new(1), ..Default::default() });
     // LAN and WAN share the same probe window, while KCP keeps its reserved time.
     let deadline = deadline.checked_sub(Duration::from_secs(3)).context("KCP budget unavailable")?
         .min(Instant::now() + Duration::from_secs(38));
@@ -82,22 +98,26 @@ pub async fn punch(
         if !sender && matches!(plan.behavior.mode, Mode::Birthday | Mode::Mixed) {
             for _ in 0..256 { sockets.push(Arc::new(UdpSocket::bind("0.0.0.0:0").await?)); }
         }
+        budget.sockets.store(sockets.len(), Ordering::Relaxed);
+        budget.report();
         let claim = Arc::new(AtomicBool::new(false));
-        let mut readers = JoinSet::new();
+        // No detached probe tasks: success, timeout and cancellation synchronously
+        // drop the losing futures, restore their TTL and release their sockets.
+        let mut readers = FuturesUnordered::new();
         for socket in sockets {
             let session = session.to_owned();
             let targets = targets.clone();
             let allowed = plan.peer.public.clone();
             let (key, nonce, data, budget, claim) = (key.clone(), nonce.clone(), data.clone(), budget.clone(), claim.clone());
             let behavior = plan.behavior;
-            readers.spawn(async move {
+            readers.push(async move {
                 exchange(socket, &session, sender, &targets, &allowed, &key, &nonce, &data, behavior, budget, claim, end).await
             });
         }
-        while let Some(result) = timeout_at(end, readers.join_next()).await? {
-            if let Ok(Ok(winner)) = result {
-                readers.abort_all();
-                while readers.join_next().await.is_some() {}
+        while let Some(result) = timeout_at(end, readers.next()).await? {
+            if let Ok(winner) = result {
+                drop(readers);
+                budget.report();
                 log::info!("native-p2p UDP {:?} confirmed, probes={}", plan.behavior, budget.sent());
                 return Ok(winner);
             }
@@ -153,6 +173,8 @@ async fn exchange(
                         sleep(Duration::from_millis(15)).await;
                     }
                 }
+                budget.authenticated.fetch_add(1, Ordering::Relaxed);
+                budget.report();
                 socket.connect(peer).await?;
                 return Ok((socket, peer));
             }

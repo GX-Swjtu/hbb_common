@@ -39,27 +39,34 @@ impl Session {
     }
 
     pub async fn punch(self, stun_server: &str) -> Result<Punched> {
-        let deadline = self.deadline;
-        timeout_at(deadline, async move {
-            let interfaces = match tokio::task::spawn_blocking(crate::interfaces::physical).await {
-                Ok(Ok(v)) => v,
-                other => { log::trace!("native UDP physical interface discovery unavailable: {other:?}"); Vec::new() }
-            };
-            self.punch_on(stun_server, &interfaces).await
-        }).await?
+        let interfaces = crate::interfaces::physical().unwrap_or_default();
+        self.punch_on(stun_server, &interfaces).await
     }
 
-    /// Uses the caller's interface inventory; the diagnostic supplies isolated veth fixtures.
-    /// RustDesk calls `punch`, which always enumerates active physical adapters itself.
-    pub async fn punch_on(self, stun_server: &str, interfaces: &[Interface]) -> Result<Punched> {
+    /// Compatibility entry point for finite diagnostics and existing callers.
+    pub async fn punch_on(mut self, stun_server: &str, interfaces: &[Interface]) -> Result<Punched> {
+        match self.probe(stun_server, interfaces, None).await {
+            Ok((socket, peer, strategy)) => Ok(Punched { socket, peer, session: self, strategy }),
+            Err(error) => { self.close().await; Err(error) }
+        }
+    }
+
+    /// Borrows the lease so cancellation leaves its explicit cleanup with the owner.
+    /// All probe futures are polled in this task; dropping this future drops their sockets.
+    pub async fn probe(&self, stun_server: &str, interfaces: &[Interface], observer: crate::progress::Observer)
+        -> Result<(Arc<UdpSocket>, SocketAddr, crate::strategy::Behavior)> {
+        use crate::progress::{report, Progress};
         let deadline = self.deadline;
-        timeout_at(deadline, async move {
+        timeout_at(deadline, async {
+            report(&observer, Progress::Stage("network"));
             let (socket, addresses) = crate::stun::discover_profile(stun_server).await?;
             self.observe_exits(interfaces).await;
             let port = socket.local_addr()?.port();
             let direct = addresses.iter().find(|a| a.port() == port && interfaces.iter().any(|i| IpAddr::V4(i.address) == a.ip())).copied();
             let candidates = Candidates { public: addresses, local: candidates::local(interfaces, port), direct };
             log::info!("native-p2p UDP observations={:?}, profile={:?}, local_candidates={}", candidates.public, crate::strategy::classify(&candidates)?, candidates.local.len());
+            report(&observer, Progress::Local(candidates.clone()));
+            report(&observer, Progress::Stage("peer"));
             let mut action = Action::Prepare { session: self.ticket.session.clone(), candidates };
             let plan = loop {
                 match rpc(&self.endpoint, &self.identity, &self.server, action, Duration::from_secs(2)).await? {
@@ -73,11 +80,13 @@ impl Session {
             };
             ensure!(plan.session == self.ticket.session, "invalid native plan");
             log::info!("native-p2p UDP selected strategy={:?}, sender={}", plan.behavior, plan.sender);
+            report(&observer, Progress::Selected(plan.clone()));
+            report(&observer, Progress::Stage("probe"));
             let (socket, peer) = tokio::select! {
-                result = crate::hole::punch(socket, &plan.session, plan.sender, &plan, &self.secret, &interfaces, deadline) => result?,
+                result = crate::hole::punch_observed(socket, &plan.session, plan.sender, &plan, &self.secret, interfaces, deadline, observer) => result?,
                 result = self.wait_for_cancellation() => return Err(result),
             };
-            Ok(Punched { socket, peer, session: self, strategy: plan.behavior })
+            Ok((socket, peer, plan.behavior))
         }).await?
     }
 }
