@@ -92,6 +92,17 @@ impl Session {
         server: sign::PublicKey,
         target: &str,
     ) -> Result<Option<Self>> {
+        Self::begin_with_timeout(endpoint, identity, server, target, Duration::from_secs(1)).await
+    }
+
+    /// A caller with authenticated evidence of server support may allow more preparation time.
+    pub async fn begin_with_timeout(
+        endpoint: &str,
+        identity: Identity,
+        server: sign::PublicKey,
+        target: &str,
+        limit: Duration,
+    ) -> Result<Option<Self>> {
         let (pk, sk) = box_::gen_keypair();
         let deadline = Instant::now() + Duration::from_secs(crate::ATTEMPT_SECONDS);
         let reply = rpc(
@@ -103,7 +114,7 @@ impl Session {
                 box_pk: pk.as_ref().to_vec(),
                 licence_key: STANDARD.encode(server.as_ref()),
             },
-            Duration::from_secs(1),
+            limit.min(Duration::from_secs(crate::ATTEMPT_SECONDS)),
         )
         .await?;
         match reply {
