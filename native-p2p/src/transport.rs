@@ -92,6 +92,17 @@ impl Session {
         server: sign::PublicKey,
         target: &str,
     ) -> Result<Option<Self>> {
+        Self::begin_with_timeout(endpoint, identity, server, target, Duration::from_secs(1)).await
+    }
+
+    /// A caller with authenticated evidence of server support may allow more preparation time.
+    pub async fn begin_with_timeout(
+        endpoint: &str,
+        identity: Identity,
+        server: sign::PublicKey,
+        target: &str,
+        limit: Duration,
+    ) -> Result<Option<Self>> {
         let (pk, sk) = box_::gen_keypair();
         let deadline = Instant::now() + Duration::from_secs(crate::ATTEMPT_SECONDS);
         let reply = rpc(
@@ -103,7 +114,7 @@ impl Session {
                 box_pk: pk.as_ref().to_vec(),
                 licence_key: STANDARD.encode(server.as_ref()),
             },
-            Duration::from_secs(1),
+            limit.min(Duration::from_secs(crate::ATTEMPT_SECONDS)),
         )
         .await?;
         match reply {
@@ -111,6 +122,7 @@ impl Session {
                 endpoint, identity, server, ticket, &pk, &sk, deadline,
             )?)),
             Reply::Unsupported => Ok(None),
+            Reply::Error(reason) => bail!(reason),
             _ => bail!("native begin declined"),
         }
     }
@@ -165,6 +177,8 @@ impl Session {
         let secret = sealedbox::open(&ticket.secret_box, pk, sk)
             .map_err(|_| anyhow::anyhow!("invalid sealed probe key"))?;
         ensure!(secret.len() == 32, "invalid probe key length");
+        // Old servers can issue a shorter lease. A local round never extends it.
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(ticket.expires.saturating_sub(now()?)));
         Ok(Self {
             ticket,
             endpoint: endpoint.into(),
@@ -198,7 +212,17 @@ impl Session {
         Ok(())
     }
 
-    async fn wait_for_cancellation(&self) -> anyhow::Error {
+    /// Normal teardown is awaited by the round owner. Drop is emergency-only.
+    pub async fn close(&mut self) {
+        if !self.cancel_on_drop { return; }
+        self.cancel_on_drop = false;
+        if let Err(error) = rpc(&self.endpoint, &self.identity, &self.server,
+            Action::Cancel { session: self.ticket.session.clone() }, Duration::from_millis(500)).await {
+            log::trace!("native cancellation notification: {error}");
+        }
+    }
+
+    pub async fn wait_for_cancellation(&self) -> anyhow::Error {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             match rpc(
@@ -252,6 +276,24 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn server_ticket_can_shorten_but_never_extend_the_round() {
+        crate::init().unwrap();
+        let (pk, sk) = box_::gen_keypair();
+        for seconds in [10, 45, 60, 120] {
+            let (server, key) = sign::gen_keypair();
+            let start = Instant::now();
+            let ticket = Ticket { session: id(), expires: now().unwrap() + seconds,
+                secret_box: seal(&[1; 32], pk.as_ref()).unwrap(), peer_id: "peer".into(),
+                signed_peer: vec![], initiator: true, capability: crate::CAPABILITY.into() };
+            let mut session = Session::new("unused", Identity { id: "device".into(), key }, server,
+                ticket, &pk, &sk, start + Duration::from_secs(60)).unwrap();
+            session.cancel_on_drop = false;
+            assert!(session.deadline <= start + Duration::from_secs(seconds.min(60)) + Duration::from_millis(50));
+            assert!(session.deadline <= start + Duration::from_secs(60));
+        }
+    }
 
     #[tokio::test]
     async fn temporary_rpc_loss_is_not_peer_cancellation() {

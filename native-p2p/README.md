@@ -2,8 +2,9 @@
 
 An optional traversal path for the RustDesk Windows/Linux forks. It retains
 RustDesk's KCP, device identity, login, confirmation and permission checks.
-Android/iOS/macOS do not link this crate through `hbb_common` and keep the
-original connection flow. The algorithms are adapted from frp v0.71.0
+The Android client uses the same default-on strategy option, with optional LAN
+candidates supplied to `Session::punch_on`; iOS/macOS keep the original connection flow.
+The algorithms are adapted from frp v0.71.0
 (`4a23aa181c1d7e28eecaa8216024ed753b9d27c8`); see `NOTICE` and `LICENSE.frp`.
 No frp executable is required.
 
@@ -13,9 +14,10 @@ The only signed feature declaration is `capability="native-udp-punch"` with an
 `enabled` boolean. Both devices and the coordinator must support this exact
 capability before a session is issued. There are no strategy generation flags
 or separate V2 switch. `enable-native-p2p=N` disables the entire native attempt.
-Older experimental native clients/servers fall back to the original RustDesk
-connection flow, just like unsupported peers; they do not retain a separate
-fixed Mode 2 path. An old server's capability wait is at most one second.
+Finite callers fall back for unsupported peers; graphical callers instead show
+the reason and wait for a user relay/cancel choice. There is no separate fixed
+Mode 2 path. `Session::begin` retains a one-second default; graphical callers use
+an explicit preparation budget of up to five seconds.
 
 The existing protobuf envelope (`NativeP2pV1`, field 1000, envelope version 1)
 and registration fields 1000/1001 are retained to avoid another upstream schema
@@ -33,7 +35,9 @@ be mistaken for the new capability. Tickets repeat the negotiated capability.
   filtering and authenticated TCP source-IP verification.
 - `strategy`: NAT evidence, five strategy families and bounded outcome scores.
 - `hole`: authenticated probes, shared budgets, TTL restoration and socket cleanup.
-- `transport`: bounded RPCs, preparation, polling and cancellation.
+- `transport`: bounded RPCs, preparation, polling and explicit awaited cancellation.
+- `progress`: optional secret-free observations and bounded structured reasons
+  carried inside the existing signed Error string, without altering Plan/Ticket.
 
 The mandatory two STUN destinations and optional crossed IP/port observations
 share six seconds; each optional observation has at most 500 ms. TCP NAT type
@@ -47,8 +51,7 @@ Each endpoint can add at most four authenticated TCP source observations within
 a shared two-second budget. The server verifies the device signature and session
 membership before admitting an IP, and retains at most four public exits per
 participant, only for that session. STUN addresses alone never prove ownership.
-Unverified UDP exits are removed; an empty result fails back to the original
-connection flow. UDP-only egress that authenticated TCP cannot observe is an
+Unverified UDP exits are removed; an empty result ends this bounded attempt. UDP-only egress that authenticated TCP cannot observe is an
 explicit coverage limit. Port deltas are never combined across public IPs.
 
 Each endpoint advertises at most eight physical-adapter RFC1918 candidates using
@@ -71,8 +74,9 @@ as the Mode 0 receiver. Its endpoint must also pass TCP source verification.
 
 The 28 role/TTL/delay combinations follow the fixed reference version (Mode 4's
 code specifies 3 s despite an older 2 s comment). Two unpredictable HardNATs
-without a usable LAN path fall back. Only one strategy is selected per connection;
-there is no chain of full waiting windows or persistent retry tunnel.
+without a usable LAN path return an explicit no-strategy reason. Only one strategy
+is selected per round. GUI retry policy lives in the client controller; this
+library never starts a persistent retry tunnel.
 
 History stores at most 1024 network-profile pairs, expires after one hour, and
 never caches winning ports. Selection subtracts one point exactly once; only
@@ -91,7 +95,7 @@ boxes. UDP probes authenticate session, direction and nonce with HMAC-SHA512/256
 Only authenticated responses from approved IPs (exact ports for LAN) may win.
 The winning socket remains open for KCP; losing tasks/sockets are cancelled.
 
-- 45 s absolute attempt deadline, including preparation and KCP; LAN and WAN
+- 60 s maximum signed lease, including preparation and KCP; LAN and WAN
   share at most 38 s of probing, with at least 3 s reserved for KCP.
 - One attempt per device; at most 257 traversal sockets per endpoint.
 - 1000 unique random IP/port combinations shared across all exits, weighted by
@@ -141,3 +145,9 @@ frames and relay traffic; a DIRECT rule name or a single UDP packet is not proof
 of P2P remote control. Real Windows acceptance, Android builds and Android real
 device tests must be reported separately. Keep the client/server common baselines
 separate and cherry-pick only this feature patch between them.
+
+The optional `Session::probe` observer leaves the lease with its caller so normal
+cleanup can await `Session::close`. Probe futures run under their owner rather
+than detached tasks: cancellation drops losing sockets and restores TTL before
+a new round. `Drop` retains a short best-effort notification only for emergencies.
+A signed ticket can shorten, never extend, the caller's monotonic deadline.

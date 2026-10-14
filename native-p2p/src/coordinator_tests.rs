@@ -114,3 +114,33 @@
         assert!(matches!(call(&mut c, &server, &caller, "caller", "192.0.2.2:2000", observe()).unwrap(), Reply::Error(_)));
         assert!(c.attempts.is_empty());
     }
+
+    #[test]
+    fn no_strategy_uses_signed_bounded_error_with_only_verified_candidates() {
+        crate::init().unwrap();
+        let mut c = Coordinator::default();
+        let (_, server) = sign::gen_keypair();
+        let caller = register(&mut c, "caller", "192.0.2.1", true);
+        let target = register(&mut c, "target", "198.51.100.1", true);
+        let Reply::Ticket(ticket) = call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", begin("target")).unwrap() else { panic!() };
+        assert_eq!(ticket.expires - protocol::now().unwrap(), 60);
+        let id = ticket.session;
+        call(&mut c, &server, &target, "target", "198.51.100.1:2000",
+            Action::Join { session: id.clone(), box_pk: box_::gen_keypair().0.as_ref().to_vec() }).unwrap();
+        for (device, key, source, values) in [
+            ("caller", &caller, "192.0.2.1:2000", ["192.0.2.1:5000", "192.0.2.1:17000", "203.0.113.99:99"]),
+            ("target", &target, "198.51.100.1:2000", ["198.51.100.1:9000", "198.51.100.1:33000", "203.0.113.99:99"]),
+        ] {
+            call(&mut c, &server, key, device, source, Action::Prepare { session: id.clone(), candidates: candidates(&values) }).unwrap();
+        }
+        let Reply::Error(error) = call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", Action::Poll { session: id.clone() }).unwrap() else { panic!() };
+        let reason = crate::progress::Reason::decode(&error).unwrap();
+        assert_eq!(reason.code, "no_strategy");
+        assert_eq!(reason.local.unwrap().public.len(), 2);
+        assert!(!error.contains("203.0.113.99"));
+        assert!(error.len() < 3072);
+        assert!(!error.contains("secret"));
+        call(&mut c, &server, &caller, "caller", "192.0.2.1:2000", Action::Cancel { session: id }).unwrap();
+        assert!(c.attempts.is_empty());
+        assert!(crate::progress::Reason::decode("old plain text reason").is_none());
+    }
