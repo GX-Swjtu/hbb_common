@@ -2,8 +2,9 @@
 
 An optional traversal path for the RustDesk Windows/Linux forks. It retains
 RustDesk's KCP, device identity, login, confirmation and permission checks.
-Android/iOS/macOS do not link this crate through `hbb_common` and keep the
-original connection flow. The algorithms are adapted from frp v0.71.0
+The Android client uses the same default-on strategy option, with optional LAN
+candidates supplied to `Session::punch_on`; iOS/macOS keep the original connection flow.
+The algorithms are adapted from frp v0.71.0
 (`4a23aa181c1d7e28eecaa8216024ed753b9d27c8`); see `NOTICE` and `LICENSE.frp`.
 No frp executable is required.
 
