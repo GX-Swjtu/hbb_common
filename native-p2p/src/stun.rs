@@ -13,11 +13,49 @@ use tokio::{
 const COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 
 pub async fn discover(server: &str) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
-    discover_inner(server, false).await
+    discover_with_fallback(server, false).await
 }
 
 pub async fn discover_profile(server: &str) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
-    discover_inner(server, true).await
+    discover_with_fallback(server, true).await
+}
+
+async fn discover_with_fallback(server: &str, characterize: bool) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
+    match discover_inner(server, characterize).await {
+        Ok(result) => Ok(result),
+        Err(error) if server == crate::STUN_SERVER => {
+            log::trace!("default STUN discovery failed: {error:#}");
+            discover_fallback(&["stun.cloudflare.com:3478", "stun.l.google.com:19302"])
+                .await.with_context(|| format!("primary STUN {server} failed: {error:#}; fallback discovery failed"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn discover_fallback(servers: &[&str]) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut destinations = Vec::new();
+    let mut addresses = Vec::new();
+    let mut failures = Vec::new();
+    for server in servers {
+        let result = async {
+            let resolve_by = deadline.min(Instant::now() + Duration::from_secs(1));
+            let endpoints = timeout_at(resolve_by, tokio::net::lookup_host(server)).await??;
+            let endpoint = endpoints.into_iter().find(|a| a.is_ipv4() && !destinations.contains(a))
+                .context("STUN has no distinct IPv4 destination")?;
+            destinations.push(endpoint);
+            let (mapped, _) = binding(&socket, endpoint, deadline).await?;
+            Ok::<_, anyhow::Error>(mapped)
+        }.await;
+        match result {
+            Ok(mapped) => addresses.push(mapped),
+            Err(error) => failures.push(format!("{server}: {error:#}")),
+        }
+        if addresses.len() >= 2 { return Ok((socket, addresses)); }
+        if Instant::now() >= deadline { break; }
+    }
+    bail!("STUN needs two distinct responding destinations (got {}): {}", addresses.len(), failures.join("; "))
 }
 
 async fn discover_inner(server: &str, characterize: bool) -> Result<(Arc<UdpSocket>, Vec<SocketAddr>)> {
@@ -27,10 +65,12 @@ async fn discover_inner(server: &str, characterize: bool) -> Result<(Arc<UdpSock
         .context("STUN has no IPv4 address")?;
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let deadline = Instant::now() + Duration::from_secs(6);
-    let (first, other) = binding(&socket, endpoint, deadline).await?;
+    let (first, other) = binding(&socket, endpoint, deadline).await
+        .with_context(|| format!("STUN {server} at {endpoint}"))?;
     let other = other.context("STUN must supply OTHER-ADDRESS or CHANGED-ADDRESS")?;
     ensure!(other != endpoint, "STUN alternate endpoint must differ");
-    let (second, _) = binding(&socket, other, deadline).await?;
+    let (second, _) = binding(&socket, other, deadline).await
+        .with_context(|| format!("STUN {server} alternate {other}"))?;
     let mut addresses = vec![first, second];
     if characterize && endpoint.ip() != other.ip() && endpoint.port() != other.port() {
         // RFC 5780's two alternate IP/port combinations provide fresh destinations.
@@ -58,6 +98,7 @@ async fn binding(
     request.extend_from_slice(&randombytes(12));
     let mut buffer = [0u8; 1500];
     for _ in 0..3 {
+        ensure!(Instant::now() < deadline, "STUN deadline exceeded");
         socket.send_to(&request, target).await?;
         let retry = deadline.min(Instant::now() + Duration::from_millis(850));
         loop {
@@ -121,6 +162,51 @@ fn parse(data: &[u8]) -> Result<(SocketAddr, Option<SocketAddr>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn basic_server() -> (String, tokio::task::JoinHandle<u16>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = socket.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            let source = loop {
+                let (n, source) = socket.recv_from(&mut buf).await.unwrap();
+                if n == 20 && buf[..2] == [0, 1] && buf[4..8] == COOKIE { break source; }
+            };
+            let mut response = vec![1, 1, 0, 12];
+            response.extend_from_slice(&buf[4..20]);
+            response.extend_from_slice(&[0, 1, 0, 8, 0, 1]);
+            response.extend_from_slice(&source.port().to_be_bytes());
+            response.extend_from_slice(&[192, 0, 2, 1]);
+            socket.send_to(&response, source).await.unwrap();
+            source.port()
+        });
+        (endpoint, task)
+    }
+
+    #[tokio::test]
+    async fn fallback_survives_a_silent_server_without_rebinding_or_alternate_attributes() {
+        crate::init().unwrap();
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (a, first) = basic_server().await;
+        let (b, second) = basic_server().await;
+        let started = Instant::now();
+        let (socket, addresses) = discover_fallback(&[&silent.local_addr().unwrap().to_string(), &a, &b]).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0], addresses[1]);
+        assert_eq!(first.await.unwrap(), port);
+        assert_eq!(second.await.unwrap(), port);
+        assert!(started.elapsed() < Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn one_responding_destination_cannot_be_reported_as_two_observations() {
+        crate::init().unwrap();
+        let (a, server) = basic_server().await;
+        let error = discover_fallback(&[&a, &a]).await.unwrap_err();
+        assert!(error.to_string().contains("got 1"));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn silent_stun_has_a_bounded_failure() {

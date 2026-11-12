@@ -24,7 +24,7 @@ pub const MAX_PACKETS: usize = 8192;
 pub const RANDOM_TARGETS: usize = 1000;
 pub const MAX_MESSAGE: usize = 16 * 1024;
 pub const ATTEMPT_SECONDS: u64 = 60;
-pub const STUN_SERVER: &str = "stun.easyvoip.com:3478";
+pub const STUN_SERVER: &str = "stun.nextcloud.com:3478";
 
 pub fn init() -> anyhow::Result<()> {
     sodiumoxide::init().map_err(|_| anyhow::anyhow!("libsodium initialization failed"))

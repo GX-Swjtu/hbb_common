@@ -30,7 +30,13 @@ be mistaken for the new capability. Tickets repeat the negotiated capability.
 - `protocol` and `coordinator`: signed capability, participant admission,
   sealed probe keys, replay/quota checks and one session lease per device.
 - `stun`: two to four distinct IPv4 destination observations using one retained
-  UDP socket and `stun.easyvoip.com:3478` plus its alternate endpoints.
+  UDP socket and `stun.nextcloud.com:3478` plus its alternate endpoints. If the
+  default service fails, Cloudflare and Google STUN provide two observations on
+  a fresh retained socket without requiring OTHER-ADDRESS support. A single
+  responding destination is insufficient. Each discovery phase is bounded
+  (primary: at most seven seconds including DNS; fallback: six seconds), and
+  the enclosing session deadline still applies. Explicit diagnostic endpoints
+  never fall back to public services.
 - `interfaces` and `candidates`: active physical IPv4 adapters, on-link LAN
   filtering and authenticated TCP source-IP verification.
 - `strategy`: NAT evidence, five strategy families and bounded outcome scores.
